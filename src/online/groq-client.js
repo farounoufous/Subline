@@ -7,9 +7,24 @@
 const API_BASE = 'https://api.groq.com/openai/v1'
 
 export const TRANSCRIPTION_MODEL = 'whisper-large-v3'
-// Du plus qualitatif au plus léger : on bascule sur le suivant quand le
-// quota gratuit du premier est atteint.
-export const TRANSLATION_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant']
+// Modèles de traduction, du plus qualitatif au plus léger. On bascule sur
+// le suivant quand le quota du premier est atteint ou qu'il n'est pas
+// accessible avec la clé de l'utilisateur.
+//
+// Les modèles Llama ont été retirés de l'offre gratuite de Groq (août
+// 2026) : les identifiants changent avec le temps. La liste réellement
+// disponible est donc demandée à l'API (GET /models) et croisée avec cette
+// liste de préférence ; `extra` règle le niveau de réflexion, pour ne pas
+// gaspiller le quota de jetons en raisonnement inutile.
+export const TRANSLATION_MODEL_PREFERENCE = [
+  { id: 'openai/gpt-oss-120b', extra: { reasoning_effort: 'low' } },
+  { id: 'qwen/qwen3.8-27b', extra: { reasoning_effort: 'none' } },
+  { id: 'openai/gpt-oss-20b', extra: { reasoning_effort: 'low' } }
+]
+
+// Modèles de l'API qui ne sont pas des modèles de texte généralistes.
+const NON_CHAT_MODEL_PATTERN = /whisper|tts|orpheus|guard|compound|embed|prompt/i
+const MAX_EXTRA_MODELS = 2
 
 export const LANGUAGE_NAMES = { fr: 'French', en: 'English' }
 
@@ -30,7 +45,8 @@ const TRANSLATION_BATCH_MAX_CHARS = 2500
 
 /**
  * kind : 'auth' (clé refusée), 'quota' (limite gratuite atteinte),
- * 'network' (Groq injoignable), 'invalid' (requête refusée), 'other'.
+ * 'network' (Groq injoignable), 'model' (modèle indisponible),
+ * 'invalid' (requête refusée), 'other'.
  */
 export class OnlineError extends Error {
   constructor(kind, message, { retryAfterSeconds = null } = {}) {
@@ -60,7 +76,7 @@ async function readErrorMessage(response) {
   }
 }
 
-async function groqFetch(path, buildInit, { apiKey, signal }) {
+async function groqFetch(path, buildInit, { apiKey, signal, modelErrors = false }) {
   let rateLimitRetries = 0
   let serverErrorRetries = 0
 
@@ -101,6 +117,11 @@ async function groqFetch(path, buildInit, { apiKey, signal }) {
     }
 
     const message = await readErrorMessage(response)
+    // Pour un appel de modèle, un 400/404 signifie "modèle absent, retiré
+    // ou paramètre non géré" : on peut essayer le modèle suivant.
+    if (modelErrors && (response.status === 400 || response.status === 404)) {
+      throw new OnlineError('model', message)
+    }
     throw new OnlineError(response.status >= 500 ? 'other' : 'invalid', message)
   }
 }
@@ -193,9 +214,37 @@ function splitIntoBatches(texts) {
  */
 export function createTranslator({ apiKey, targetLanguage, signal }) {
   const targetName = LANGUAGE_NAMES[targetLanguage]
+  let models = null
   let modelIndex = 0
 
+  // Croise la liste de préférence avec les modèles réellement accessibles.
+  // Si la liste ne peut pas être lue, on tente la liste de préférence telle
+  // quelle (les erreurs "modèle indisponible" font passer au suivant).
+  async function resolveModels() {
+    if (models) return models
+    try {
+      const response = await groqFetch('/models', () => ({ method: 'GET' }), { apiKey, signal })
+      const data = await response.json()
+      const available = new Set((data.data || []).map((m) => m.id))
+      const preferred = TRANSLATION_MODEL_PREFERENCE.filter((m) => available.has(m.id))
+      const known = new Set(TRANSLATION_MODEL_PREFERENCE.map((m) => m.id))
+      const extras = [...available]
+        .filter((id) => !known.has(id) && !NON_CHAT_MODEL_PATTERN.test(id))
+        .slice(0, MAX_EXTRA_MODELS)
+        .map((id) => ({ id, extra: {} }))
+      const resolved = [...preferred, ...extras]
+      models = resolved.length > 0 ? resolved : TRANSLATION_MODEL_PREFERENCE
+    } catch (error) {
+      if (error.name === 'AbortError' || (error instanceof OnlineError && error.kind === 'auth')) throw error
+      models = TRANSLATION_MODEL_PREFERENCE
+    }
+    return models
+  }
+
   async function callModel(lines) {
+    const available = await resolveModels()
+    const model = available[modelIndex]
+
     const system =
       `You are a professional subtitle translator. Translate each subtitle line into ${targetName}. ` +
       'Preserve meaning, tone and register; keep each line concise and natural for on-screen reading; keep proper names unchanged. ' +
@@ -206,9 +255,10 @@ export function createTranslator({ apiKey, targetLanguage, signal }) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: TRANSLATION_MODELS[modelIndex],
+        model: model.id,
         temperature: 0.2,
         response_format: { type: 'json_object' },
+        ...model.extra,
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: JSON.stringify({ lines }) }
@@ -216,9 +266,15 @@ export function createTranslator({ apiKey, targetLanguage, signal }) {
       })
     })
 
-    const response = await groqFetch('/chat/completions', buildInit, { apiKey, signal })
+    const response = await groqFetch('/chat/completions', buildInit, { apiKey, signal, modelErrors: true })
     const data = await response.json()
-    const content = data?.choices?.[0]?.message?.content
+    const raw = String(data?.choices?.[0]?.message?.content || '')
+    // Certains modèles de raisonnement laissent un bloc <think> ou des
+    // balises de code autour du JSON.
+    const content = raw
+      .replace(/<think>[\s\S]*?<\/think>/g, '')
+      .replace(/^```(?:json)?\s*|\s*```$/g, '')
+      .trim()
     const parsed = JSON.parse(content)
     if (!Array.isArray(parsed.translations) || parsed.translations.length !== lines.length) {
       throw new OnlineError('other', 'Réponse de traduction inattendue.')
@@ -226,18 +282,27 @@ export function createTranslator({ apiKey, targetLanguage, signal }) {
     return parsed.translations.map((t, i) => (typeof t === 'string' && t.trim() ? t.trim() : lines[i]))
   }
 
-  // Un lot : bascule sur le modèle léger si le quota est atteint ; en cas
-  // de réponse mal formée, on scinde le lot jusqu'à la ligne seule, puis
-  // on conserve le texte d'origine plutôt que de perdre le sous-titre.
+  // Un lot : passe au modèle suivant si le quota est atteint ou si le
+  // modèle est indisponible ; en cas de réponse mal formée, on scinde le
+  // lot jusqu'à la ligne seule, puis on conserve le texte d'origine plutôt
+  // que de perdre le sous-titre.
   async function translateBatch(lines) {
     while (true) {
       try {
         return await callModel(lines)
       } catch (error) {
         if (error.name === 'AbortError') throw error
-        if (error instanceof OnlineError && error.kind === 'quota' && modelIndex < TRANSLATION_MODELS.length - 1) {
-          modelIndex++
-          continue
+
+        if (error instanceof OnlineError && (error.kind === 'quota' || error.kind === 'model')) {
+          const lastIndex = (models?.length || 1) - 1
+          if (modelIndex < lastIndex) {
+            modelIndex++
+            continue
+          }
+          if (error.kind === 'model') {
+            throw new OnlineError('other', `Aucun modèle de traduction accessible avec cette clé (${error.message}).`)
+          }
+          throw error
         }
         if (error instanceof OnlineError && error.kind !== 'other') throw error
 
