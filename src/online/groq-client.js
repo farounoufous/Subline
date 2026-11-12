@@ -1,0 +1,258 @@
+// Client minimal de l'API Groq (compatible OpenAI) : transcription avec
+// Whisper large-v3 puis traduction du texte par un modèle de langage.
+//
+// La clé API est celle de l'utilisateur, fournie depuis son navigateur ;
+// seul l'audio compressé (jamais la vidéo) est envoyé.
+
+const API_BASE = 'https://api.groq.com/openai/v1'
+
+export const TRANSCRIPTION_MODEL = 'whisper-large-v3'
+// Du plus qualitatif au plus léger : on bascule sur le suivant quand le
+// quota gratuit du premier est atteint.
+export const TRANSLATION_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant']
+
+export const LANGUAGE_NAMES = { fr: 'French', en: 'English' }
+
+// Attente maximale acceptée avant de retenter après un 429 : au-delà, on
+// considère le quota comme épuisé (limite par heure ou par jour).
+const MAX_RETRY_WAIT_SECONDS = 60
+const MAX_RATE_LIMIT_RETRIES = 3
+const MAX_SERVER_ERROR_RETRIES = 2
+
+// Seuils habituels de Whisper pour écarter les segments non fiables.
+const NO_SPEECH_PROB_THRESHOLD = 0.6
+const LOW_LOGPROB_THRESHOLD = -1
+const COMPRESSION_RATIO_THRESHOLD = 2.4
+
+// Budget d'un lot de lignes à traduire (équilibre qualité / nombre d'appels).
+const TRANSLATION_BATCH_MAX_LINES = 25
+const TRANSLATION_BATCH_MAX_CHARS = 2500
+
+/**
+ * kind : 'auth' (clé refusée), 'quota' (limite gratuite atteinte),
+ * 'network' (Groq injoignable), 'invalid' (requête refusée), 'other'.
+ */
+export class OnlineError extends Error {
+  constructor(kind, message, { retryAfterSeconds = null } = {}) {
+    super(message)
+    this.name = 'OnlineError'
+    this.kind = kind
+    this.retryAfterSeconds = retryAfterSeconds
+  }
+}
+
+function sleep(seconds, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, seconds * 1000)
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer)
+      reject(new DOMException('Annulé', 'AbortError'))
+    }, { once: true })
+  })
+}
+
+async function readErrorMessage(response) {
+  try {
+    const body = await response.json()
+    return body?.error?.message || `Erreur ${response.status}`
+  } catch {
+    return `Erreur ${response.status}`
+  }
+}
+
+async function groqFetch(path, buildInit, { apiKey, signal }) {
+  let rateLimitRetries = 0
+  let serverErrorRetries = 0
+
+  while (true) {
+    let response
+    try {
+      const init = buildInit()
+      response = await fetch(`${API_BASE}${path}`, {
+        ...init,
+        headers: { Authorization: `Bearer ${apiKey}`, ...(init.headers || {}) },
+        signal
+      })
+    } catch (error) {
+      if (error.name === 'AbortError') throw error
+      throw new OnlineError('network', 'Connexion au service en ligne impossible. Vérifiez votre connexion Internet.')
+    }
+
+    if (response.ok) return response
+
+    if (response.status === 401 || response.status === 403) {
+      throw new OnlineError('auth', 'Clé API refusée. Vérifiez qu\'elle est correcte et active.')
+    }
+
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get('retry-after')) || 0
+      if (retryAfter > 0 && retryAfter <= MAX_RETRY_WAIT_SECONDS && rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
+        rateLimitRetries++
+        await sleep(retryAfter + 0.5, signal)
+        continue
+      }
+      throw new OnlineError('quota', 'Limite du quota gratuit atteinte.', { retryAfterSeconds: retryAfter || null })
+    }
+
+    if (response.status >= 500 && serverErrorRetries < MAX_SERVER_ERROR_RETRIES) {
+      serverErrorRetries++
+      await sleep(2 * serverErrorRetries, signal)
+      continue
+    }
+
+    const message = await readErrorMessage(response)
+    throw new OnlineError(response.status >= 500 ? 'other' : 'invalid', message)
+  }
+}
+
+function isReliableSegment(segment) {
+  if (segment.noSpeechProb > NO_SPEECH_PROB_THRESHOLD && segment.avgLogprob < LOW_LOGPROB_THRESHOLD) return false
+  if (segment.compressionRatio > COMPRESSION_RATIO_THRESHOLD) return false
+  return true
+}
+
+/**
+ * Transcrit un morceau audio. Les timestamps renvoyés sont relatifs au
+ * début du morceau.
+ *
+ * @returns {{ language: string | undefined, segments: { start: number, end: number, text: string, reliable: boolean }[] }}
+ */
+export async function transcribeChunk(blob, { apiKey, signal, prompt }) {
+  const buildInit = () => {
+    const form = new FormData()
+    form.append('file', blob, 'audio.mp3')
+    form.append('model', TRANSCRIPTION_MODEL)
+    form.append('response_format', 'verbose_json')
+    form.append('timestamp_granularities[]', 'segment')
+    form.append('temperature', '0')
+    if (prompt) form.append('prompt', prompt.slice(-500))
+    return { method: 'POST', body: form }
+  }
+
+  const response = await groqFetch('/audio/transcriptions', buildInit, { apiKey, signal })
+  const data = await response.json()
+
+  const rawSegments = Array.isArray(data.segments) && data.segments.length > 0
+    ? data.segments
+    : (data.text?.trim() ? [{ start: 0, end: data.duration || 0, text: data.text }] : [])
+
+  const segments = rawSegments
+    .map((s) => ({
+      start: s.start,
+      end: s.end,
+      text: String(s.text || '').trim(),
+      reliable: isReliableSegment({
+        noSpeechProb: s.no_speech_prob,
+        avgLogprob: s.avg_logprob,
+        compressionRatio: s.compression_ratio
+      })
+    }))
+    .filter((s) => s.text)
+
+  return { language: data.language, segments }
+}
+
+// 'french' / 'fr' -> 'fr' ; inconnu -> null.
+function normalizeLanguage(language) {
+  if (!language) return null
+  const value = String(language).toLowerCase()
+  if (value === 'fr' || value === 'french') return 'fr'
+  if (value === 'en' || value === 'english') return 'en'
+  return value
+}
+
+// Faut-il traduire ? Si la langue détectée est inconnue, on laisse le
+// modèle trancher : la consigne lui demande de renvoyer tel quel un
+// texte déjà dans la langue cible.
+export function needsTranslation(detectedLanguage, targetLanguage) {
+  const detected = normalizeLanguage(detectedLanguage)
+  return detected === null || detected !== targetLanguage
+}
+
+function splitIntoBatches(texts) {
+  const batches = []
+  let current = []
+  let chars = 0
+  for (const text of texts) {
+    if (current.length > 0 && (current.length >= TRANSLATION_BATCH_MAX_LINES || chars + text.length > TRANSLATION_BATCH_MAX_CHARS)) {
+      batches.push(current)
+      current = []
+      chars = 0
+    }
+    current.push(text)
+    chars += text.length
+  }
+  if (current.length > 0) batches.push(current)
+  return batches
+}
+
+/**
+ * Crée un traducteur de sous-titres. Il garde en mémoire le modèle en
+ * cours : une fois le quota du modèle principal atteint, tous les
+ * appels suivants utilisent directement le modèle de repli.
+ */
+export function createTranslator({ apiKey, targetLanguage, signal }) {
+  const targetName = LANGUAGE_NAMES[targetLanguage]
+  let modelIndex = 0
+
+  async function callModel(lines) {
+    const system =
+      `You are a professional subtitle translator. Translate each subtitle line into ${targetName}. ` +
+      'Preserve meaning, tone and register; keep each line concise and natural for on-screen reading; keep proper names unchanged. ' +
+      'Never merge, split, add or drop lines. If a line is already in ' + targetName + ', return it unchanged. ' +
+      `Reply only with a JSON object {"translations": [...]} holding exactly ${lines.length} strings, in the same order.`
+
+    const buildInit = () => ({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: TRANSLATION_MODELS[modelIndex],
+        temperature: 0.2,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: JSON.stringify({ lines }) }
+        ]
+      })
+    })
+
+    const response = await groqFetch('/chat/completions', buildInit, { apiKey, signal })
+    const data = await response.json()
+    const content = data?.choices?.[0]?.message?.content
+    const parsed = JSON.parse(content)
+    if (!Array.isArray(parsed.translations) || parsed.translations.length !== lines.length) {
+      throw new OnlineError('other', 'Réponse de traduction inattendue.')
+    }
+    return parsed.translations.map((t, i) => (typeof t === 'string' && t.trim() ? t.trim() : lines[i]))
+  }
+
+  // Un lot : bascule sur le modèle léger si le quota est atteint ; en cas
+  // de réponse mal formée, on scinde le lot jusqu'à la ligne seule, puis
+  // on conserve le texte d'origine plutôt que de perdre le sous-titre.
+  async function translateBatch(lines) {
+    while (true) {
+      try {
+        return await callModel(lines)
+      } catch (error) {
+        if (error.name === 'AbortError') throw error
+        if (error instanceof OnlineError && error.kind === 'quota' && modelIndex < TRANSLATION_MODELS.length - 1) {
+          modelIndex++
+          continue
+        }
+        if (error instanceof OnlineError && error.kind !== 'other') throw error
+
+        if (lines.length === 1) return lines
+        const middle = Math.ceil(lines.length / 2)
+        return [...(await translateBatch(lines.slice(0, middle))), ...(await translateBatch(lines.slice(middle)))]
+      }
+    }
+  }
+
+  return async function translate(texts) {
+    const result = []
+    for (const batch of splitIntoBatches(texts)) {
+      result.push(...(await translateBatch(batch)))
+    }
+    return result
+  }
+}

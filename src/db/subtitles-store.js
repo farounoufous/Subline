@@ -12,7 +12,7 @@ const STORE_NAME = 'processedVideos'
 // Progression d'un traitement interrompu, segment par segment, pour
 // pouvoir le reprendre sans tout recalculer.
 const PARTIALS_STORE_NAME = 'partialProgress'
-const CACHE_FORMAT_VERSION = 5
+const CACHE_FORMAT_VERSION = 6
 
 function openDatabase() {
   return new Promise((resolve, reject) => {
@@ -49,6 +49,11 @@ async function withStore(mode, operation, storeName = STORE_NAME) {
     db.close()
   }
 }
+
+// Une même vidéo peut avoir des sous-titres dans plusieurs langues
+// (anglais produit en local ou en ligne, français produit en ligne) :
+// l'entrée est donc indexée par empreinte + langue de sortie.
+export const subtitleCacheKey = (fingerprint, language) => `${fingerprint}::${language}`
 
 export async function getProcessedVideo(fingerprint) {
   const entry = await withStore('readonly', (store) => store.get(fingerprint))

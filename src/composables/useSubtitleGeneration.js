@@ -1,6 +1,6 @@
-// Orchestre la génération des sous-titres : décodage audio en flux,
-// pool de workers Whisper, nettoyage, reprise après interruption,
-// progression et temps restant estimé.
+// Orchestre la génération des sous-titres, en local (ffmpeg + VAD + pool de
+// workers Whisper) ou en ligne (audio compressé envoyé à Groq) : nettoyage,
+// reprise après interruption, progression et temps restant estimé.
 //
 // Le composant vidéo ne s'occupe que de la lecture et de l'affichage ;
 // tout l'état de la génération vit ici.
@@ -10,6 +10,8 @@ import { streamAudioSegments } from '../audio/audio-stream.js'
 import { createInferencePool } from '../workers/worker-pool.js'
 import { formatClause, applyReadingTiming } from '../utils/subtitle-format.js'
 import { cleanSubtitles } from '../utils/hallucination-filter.js'
+import { runOnlinePipeline } from '../online/online-pipeline.js'
+import { OnlineError } from '../online/groq-client.js'
 import {
   getPartialProgress,
   savePartialProgress,
@@ -40,6 +42,17 @@ export function useSubtitleGeneration() {
   const etaSeconds = ref(null)
   // Progression d'un traitement interrompu retrouvé : { percent } | null
   const partialInfo = ref(null)
+  // Moteur de la dernière génération : 'local' | 'online'
+  const engine = ref('local')
+  // Nature de l'erreur en ligne : 'auth' | 'quota' | 'network' | 'invalid' | 'other' | null
+  const errorKind = ref(null)
+  // Langue des sous-titres produits : 'en' | 'fr' | 'mixed' (reprise en local d'un travail en ligne)
+  const outputLanguage = ref('en')
+  const detectedLanguage = ref(null)
+  // Une génération en ligne interrompue peut être terminée en local.
+  const canContinueLocally = computed(
+    () => status.value === 'error' && engine.value === 'online' && errorKind.value !== 'auth' && subtitles.value.length > 0
+  )
 
   const progressPercent = computed(() => {
     if (totalDuration.value <= 0) return 0
@@ -59,6 +72,8 @@ export function useSubtitleGeneration() {
   let readyAtGenerationStart = 0
   let lastPartialSave = 0
   let storageKey = null
+  let seedEntries = []         // travail repris d'une génération en ligne
+  let seedPartialKey = null
 
   function resetRunState() {
     registry = []
@@ -69,6 +84,8 @@ export function useSubtitleGeneration() {
     generationStartedAt = 0
     readyAtGenerationStart = 0
     lastPartialSave = 0
+    seedEntries = []
+    seedPartialKey = null
     pool = null
     subtitles.value = []
     readyUpToTime.value = 0
@@ -79,10 +96,16 @@ export function useSubtitleGeneration() {
     modelDownloadProgress.value = 0
     processingPhase.value = 'decoding'
     errorMessage.value = ''
+    errorKind.value = null
+    detectedLanguage.value = null
+    outputLanguage.value = 'en'
   }
 
   function rebuildSubtitles() {
     const all = []
+    for (const entry of seedEntries) {
+      for (const block of entry.blocks) all.push({ ...block })
+    }
     for (const entry of blocksBySegment.values()) {
       for (const block of entry.blocks) all.push({ ...block })
     }
@@ -191,17 +214,31 @@ export function useSubtitleGeneration() {
    * sous-titres ; rejette en cas d'erreur fatale. Résout avec null si
    * la génération a été annulée.
    */
-  async function start(file, { fingerprint, mode, durationHint }) {
+  async function start(file, { fingerprint, mode, durationHint, seed = null }) {
     cancel()
     resetRunState()
     const runToken = ++runId
     abortController = new AbortController()
     const signal = abortController.signal
     storageKey = partialKey(fingerprint, mode)
+    engine.value = 'local'
     status.value = 'processing'
     partialInfo.value = null
     if (Number.isFinite(durationHint) && durationHint > 0) {
       totalDuration.value = durationHint
+    }
+
+    // Reprise en local d'un travail commencé en ligne : on conserve les
+    // sous-titres déjà obtenus et on ne traite que la suite.
+    let startAt = 0
+    if (seed) {
+      seedEntries = seed.entries
+      seedPartialKey = seed.partialKey
+      startAt = seed.horizon
+      horizon = seed.horizon
+      readyUpToTime.value = seed.horizon
+      outputLanguage.value = 'mixed'
+      rebuildSubtitles()
     }
 
     let resumeMap = new Map()
@@ -216,7 +253,7 @@ export function useSubtitleGeneration() {
     try {
       let nextIndex = 0
 
-      for await (const chunk of streamAudioSegments(file, { durationHint, signal })) {
+      for await (const chunk of streamAudioSegments(file, { durationHint, signal, startAt })) {
         if (runToken !== runId) return null
 
         const toProcess = []
@@ -269,6 +306,7 @@ export function useSubtitleGeneration() {
       status.value = 'ready'
 
       deletePartialProgress(storageKey).catch(() => {})
+      if (seedPartialKey) deletePartialProgress(seedPartialKey).catch(() => {})
       return subtitles.value
     } catch (error) {
       if (runToken !== runId) return null
@@ -277,6 +315,126 @@ export function useSubtitleGeneration() {
       errorMessage.value = (fatalError || error).message
       throw fatalError || error
     }
+  }
+
+  function describeOnlineError(error) {
+    if (!(error instanceof OnlineError)) return `Échec du traitement en ligne : ${error.message}`
+    if (error.kind === 'quota') {
+      const wait = error.retryAfterSeconds
+      const hint = wait ? ` Réessayez dans ${wait >= 90 ? `${Math.ceil(wait / 60)} min` : `${wait} s`}.` : ' Réessayez plus tard.'
+      return `Le quota gratuit du service en ligne est atteint.${hint} La progression est conservée.`
+    }
+    if (error.kind === 'network') return `${error.message} La progression est conservée.`
+    return error.message
+  }
+
+  /**
+   * Génération en ligne : l'audio compressé est envoyé par fenêtres à
+   * Groq. Reprend automatiquement à la fin de la dernière fenêtre déjà
+   * traitée si une progression existe pour cette vidéo et cette langue.
+   */
+  async function startOnline(file, { fingerprint, apiKey, targetLanguage, durationHint }) {
+    cancel()
+    resetRunState()
+    const runToken = ++runId
+    abortController = new AbortController()
+    const signal = abortController.signal
+    storageKey = partialKey(fingerprint, `online-${targetLanguage}`)
+    engine.value = 'online'
+    outputLanguage.value = targetLanguage
+    status.value = 'processing'
+    partialInfo.value = null
+    if (Number.isFinite(durationHint) && durationHint > 0) {
+      totalDuration.value = durationHint
+    }
+
+    let startAt = 0
+    try {
+      const partial = await getPartialProgress(storageKey)
+      if (partial) {
+        for (const saved of [...partial.segments].sort((a, b) => a.startTime - b.startTime)) {
+          const index = registry.length
+          registry.push({ startTime: saved.startTime, endTime: saved.endTime, done: true })
+          const entry = { ...saved, index }
+          blocksBySegment.set(index, entry)
+          doneSegments.set(index, entry)
+          startAt = Math.max(startAt, saved.endTime)
+        }
+        horizon = startAt
+        rebuildSubtitles()
+        recomputeReady()
+      }
+    } catch (error) {
+      console.warn('Lecture de la progression sauvegardée impossible :', error.message)
+    }
+
+    processingPhase.value = 'generating'
+    generationStartedAt = Date.now()
+    readyAtGenerationStart = readyUpToTime.value
+
+    try {
+      await runOnlinePipeline(file, {
+        apiKey,
+        targetLanguage,
+        durationHint,
+        signal,
+        startAt,
+        onWindow: (window) => {
+          if (runToken !== runId) return
+          const index = registry.length
+          registry.push({ startTime: window.startTime, endTime: window.endTime, done: true })
+
+          const entry = {
+            index,
+            startTime: window.startTime,
+            endTime: window.endTime,
+            blocks: window.clauses.flatMap((clause) => formatClause(clause))
+          }
+          blocksBySegment.set(index, entry)
+          doneSegments.set(index, entry)
+          if (window.language) detectedLanguage.value = window.language
+
+          horizon = window.horizon
+          rebuildSubtitles()
+          recomputeReady()
+          maybeSavePartial()
+        }
+      })
+      if (runToken !== runId) return null
+
+      if (!(totalDuration.value > 0)) totalDuration.value = horizon
+      readyUpToTime.value = totalDuration.value
+      playbackUnlocked.value = true
+      etaSeconds.value = null
+      status.value = 'ready'
+
+      deletePartialProgress(storageKey).catch(() => {})
+      return subtitles.value
+    } catch (error) {
+      if (runToken !== runId) return null
+      maybeSavePartial(true)
+      status.value = 'error'
+      errorKind.value = error instanceof OnlineError ? error.kind : 'other'
+      errorMessage.value = describeOnlineError(error)
+      throw error
+    }
+  }
+
+  /**
+   * Termine en local (sous-titres en anglais) une génération en ligne
+   * interrompue : les sous-titres déjà obtenus sont conservés.
+   */
+  async function continueLocally(file, { fingerprint, onlineTarget, localMode, durationHint }) {
+    const onlineKey = partialKey(fingerprint, `online-${onlineTarget}`)
+    const partial = await getPartialProgress(onlineKey)
+    const seed = partial && partial.segments.length > 0
+      ? {
+          entries: partial.segments,
+          horizon: Math.max(...partial.segments.map((s) => s.endTime)),
+          partialKey: onlineKey
+        }
+      : null
+    return start(file, { fingerprint, mode: localMode, durationHint, seed })
   }
 
   function cancel() {
@@ -291,6 +449,7 @@ export function useSubtitleGeneration() {
     cancel()
     resetRunState()
     subtitles.value = entry.subtitles
+    outputLanguage.value = entry.language || 'en'
     totalDuration.value = entry.durationSeconds || 0
     readyUpToTime.value = totalDuration.value
     playbackUnlocked.value = true
@@ -317,7 +476,14 @@ export function useSubtitleGeneration() {
     etaSeconds,
     progressPercent,
     partialInfo,
+    engine,
+    errorKind,
+    outputLanguage,
+    detectedLanguage,
+    canContinueLocally,
     start,
+    startOnline,
+    continueLocally,
     cancel,
     reset,
     restoreFromCache,

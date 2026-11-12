@@ -3,20 +3,15 @@ import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { computeFingerprint } from '../utils/fingerprint.js'
 import { captureThumbnail } from '../utils/thumbnail.js'
 import { toSrt, toVtt, downloadTextFile } from '../utils/subtitle-export.js'
-import { getProcessedVideo, saveProcessedVideo } from '../db/subtitles-store.js'
+import { getProcessedVideo, saveProcessedVideo, subtitleCacheKey } from '../db/subtitles-store.js'
 import { useVideoHistory } from '../db/useVideoHistory.js'
 import { useSubtitleGeneration } from '../composables/useSubtitleGeneration.js'
-import { MODEL_DOWNLOAD_SIZE_LABEL } from '../audio/constants.js'
 import AppIcon from './ui/AppIcon.vue'
 import TranscriptPanel from './TranscriptPanel.vue'
+import GenerationPanel from './GenerationPanel.vue'
 
-// Langue de la vidéo : 'english' (transcription) ou 'translate'
-// (traduction vers l'anglais). Mémorisée comme simple confort.
-const SOURCE_MODE_STORAGE_KEY = 'subline:source-mode'
-const SOURCE_OPTIONS = [
-  { value: 'english', label: 'Anglais' },
-  { value: 'translate', label: 'Autre langue (traduire en anglais)' }
-]
+const LANGUAGE_LABELS = { en: 'English', fr: 'Français', mixed: 'Français puis English' }
+const CACHED_LANGUAGES = ['en', 'fr', 'mixed']
 
 const { refresh: refreshHistory } = useVideoHistory()
 const generation = useSubtitleGeneration()
@@ -32,7 +27,11 @@ const {
   silenceSkippedSeconds,
   etaSeconds,
   progressPercent,
-  partialInfo
+  partialInfo,
+  engine,
+  errorKind,
+  outputLanguage,
+  canContinueLocally
 } = generation
 
 const playerContainerRef = ref(null)
@@ -43,30 +42,18 @@ const isDraggingOver = ref(false)
 const isFullscreen = ref(false)
 const restoredFromCache = ref(false)
 const showCatchUpPrompt = ref(false)
+// Durée de la vidéo, réactive (l'élément <video> ne l'est pas).
+const videoDuration = ref(0)
 
 const activeIndex = ref(-1)
 const activeSubtitleText = ref('')
 // Décalage manuel de l'affichage des sous-titres (secondes).
 const subtitleOffset = ref(0)
 
-function readStoredSourceMode() {
-  try {
-    return localStorage.getItem(SOURCE_MODE_STORAGE_KEY) === 'translate' ? 'translate' : 'english'
-  } catch {
-    return 'english'
-  }
-}
-
-const sourceMode = ref(readStoredSourceMode())
-
-function setSourceMode(mode) {
-  sourceMode.value = mode
-  try {
-    localStorage.setItem(SOURCE_MODE_STORAGE_KEY, mode)
-  } catch {
-    // Stockage indisponible (navigation privée...) : sans conséquence.
-  }
-}
+// Sélection courante du panneau de génération (pour chercher la bonne
+// progression interrompue) et derniers paramètres, pour pouvoir réessayer.
+let currentPartialMode = 'english'
+let lastOptions = null
 
 let objectUrl = null
 let currentFile = null
@@ -153,18 +140,24 @@ function exportSubtitles(format) {
     endTime: Math.max(0, s.endTime + subtitleOffset.value)
   }))
   const baseName = (fileName.value || 'subline').replace(/\.[^.]+$/, '')
+  const languageCode = outputLanguage.value === 'fr' ? 'fr' : 'en'
 
   if (format === 'srt') {
-    downloadTextFile(toSrt(shifted), `${baseName}.en.srt`, 'application/x-subrip')
+    downloadTextFile(toSrt(shifted), `${baseName}.${languageCode}.srt`, 'application/x-subrip')
   } else {
-    downloadTextFile(toVtt(shifted), `${baseName}.en.vtt`, 'text/vtt')
+    downloadTextFile(toVtt(shifted), `${baseName}.${languageCode}.vtt`, 'text/vtt')
   }
 }
 
 // --- Cache et génération ---
 
 async function checkCache(fingerprint) {
-  const cached = await getProcessedVideo(fingerprint)
+  // Plusieurs langues peuvent exister pour une même vidéo : on restaure
+  // la plus récente.
+  const candidates = await Promise.all(
+    CACHED_LANGUAGES.map((language) => getProcessedVideo(subtitleCacheKey(fingerprint, language)))
+  )
+  const cached = candidates.filter(Boolean).sort((a, b) => b.createdAt - a.createdAt)[0]
   if (!cached || fingerprint !== currentFingerprint) return
 
   generation.restoreFromCache(cached)
@@ -180,12 +173,14 @@ async function checkCache(fingerprint) {
 async function persistResult(fingerprint, file) {
   if (fingerprint !== currentFingerprint) return
 
+  const language = outputLanguage.value
   const thumbnailDataUrl = await captureThumbnail(objectUrl)
   await saveProcessedVideo({
-    fingerprint,
+    fingerprint: subtitleCacheKey(fingerprint, language),
     fileName: file.name,
     durationSeconds: videoRef.value?.duration || 0,
-    sourceMode: sourceMode.value,
+    language,
+    engine: engine.value,
     subtitles: subtitles.value,
     thumbnailDataUrl,
     createdAt: Date.now()
@@ -195,31 +190,35 @@ async function persistResult(fingerprint, file) {
 
 async function refreshPartialInfo() {
   if (!currentFingerprint || status.value !== 'idle') return
-  await generation.checkPartial(currentFingerprint, sourceMode.value, videoRef.value?.duration || 0)
+  await generation.checkPartial(currentFingerprint, currentPartialMode, videoRef.value?.duration || 0)
 }
 
-function onLoadedMetadata() {
+function onSelectionChange({ partialMode }) {
+  currentPartialMode = partialMode
   refreshPartialInfo()
 }
 
-watch(sourceMode, refreshPartialInfo)
+function onLoadedMetadata() {
+  videoDuration.value = videoRef.value?.duration || 0
+  refreshPartialInfo()
+}
 
-async function generateSubtitles() {
-  if (!currentFile || status.value === 'processing') return
-
+function prepareRun() {
   restoredFromCache.value = false
   showCatchUpPrompt.value = false
   bypassCatchUpCheck = false
+}
+
+// Lance une génération et sauvegarde le résultat en cas de succès.
+async function runGeneration(task) {
+  if (!currentFile || status.value === 'processing') return
+  prepareRun()
 
   const fingerprint = currentFingerprint
   const file = currentFile
 
   try {
-    const result = await generation.start(file, {
-      fingerprint,
-      mode: sourceMode.value,
-      durationHint: videoRef.value?.duration
-    })
+    const result = await task({ fingerprint, file, durationHint: videoRef.value?.duration })
     if (result === null) return // annulée (autre vidéo chargée)
   } catch (error) {
     console.error('Échec de la génération :', error)
@@ -231,6 +230,43 @@ async function generateSubtitles() {
   } catch (error) {
     console.warn('Sauvegarde du résultat dans IndexedDB impossible :', error.message)
   }
+}
+
+function generateSubtitles(options) {
+  lastOptions = options
+  return runGeneration(({ fingerprint, file, durationHint }) => {
+    if (options.engine === 'online') {
+      return generation.startOnline(file, {
+        fingerprint,
+        apiKey: options.apiKey,
+        targetLanguage: options.targetLanguage,
+        durationHint
+      })
+    }
+    return generation.start(file, { fingerprint, mode: options.sourceMode, durationHint })
+  })
+}
+
+function retryGeneration() {
+  if (lastOptions) generateSubtitles(lastOptions)
+}
+
+function continueInLocal() {
+  const options = lastOptions
+  if (!options) return
+  return runGeneration(({ fingerprint, file, durationHint }) =>
+    generation.continueLocally(file, {
+      fingerprint,
+      onlineTarget: options.targetLanguage,
+      localMode: options.sourceMode,
+      durationHint
+    })
+  )
+}
+
+function backToSettings() {
+  generation.reset()
+  refreshPartialInfo()
 }
 
 function loadFile(file) {
@@ -253,6 +289,7 @@ function loadFile(file) {
   showCatchUpPrompt.value = false
   bypassCatchUpCheck = false
   subtitleOffset.value = 0
+  videoDuration.value = 0
 
   checkCache(currentFingerprint)
 }
@@ -369,34 +406,13 @@ onBeforeUnmount(() => {
           </div>
 
           <!-- Prêt à générer -->
-          <div v-if="status === 'idle'" class="flex flex-col gap-4 rounded-xl bg-ink-50 p-4">
-            <div>
-              <p class="text-sm font-medium text-ink-900">Langue parlée dans la vidéo</p>
-              <div class="mt-2 inline-flex rounded-lg border border-ink-200 bg-white p-1" role="radiogroup" aria-label="Langue parlée dans la vidéo">
-                <button
-                  v-for="option in SOURCE_OPTIONS"
-                  :key="option.value"
-                  role="radio"
-                  :aria-checked="sourceMode === option.value"
-                  class="rounded-md px-3 py-1.5 text-sm transition-colors"
-                  :class="sourceMode === option.value ? 'bg-brand-600 text-white' : 'text-ink-600 hover:text-ink-900'"
-                  @click="setSourceMode(option.value)"
-                >
-                  {{ option.label }}
-                </button>
-              </div>
-            </div>
-            <p class="text-sm text-ink-600">
-              Les sous-titres sont générés en anglais, entièrement en local. Au premier usage, le modèle IA
-              ({{ MODEL_DOWNLOAD_SIZE_LABEL }}) est téléchargé, puis conservé pour un usage hors ligne.
-            </p>
-            <p v-if="partialInfo" class="rounded-lg bg-brand-50 px-3 py-2 text-sm text-brand-900">
-              Une génération interrompue a été retrouvée ({{ partialInfo.percent }} % déjà traité). Elle sera reprise là où elle s'est arrêtée.
-            </p>
-            <button class="btn-primary self-start" @click="generateSubtitles">
-              {{ partialInfo ? 'Reprendre la génération' : 'Générer les sous-titres' }}
-            </button>
-          </div>
+          <GenerationPanel
+            v-if="status === 'idle'"
+            :partial-info="partialInfo"
+            :duration-seconds="videoDuration"
+            @selection="onSelectionChange"
+            @generate="generateSubtitles"
+          />
 
           <!-- Traitement en cours -->
           <div v-if="status === 'processing'" class="flex flex-col gap-3">
@@ -407,14 +423,14 @@ onBeforeUnmount(() => {
 
             <div class="flex flex-col gap-1.5">
               <p class="text-sm text-ink-700">
-                <template v-if="processingPhase === 'decoding'">Préparation de l'audio et détection de la parole...</template>
+                <template v-if="processingPhase === 'decoding'">Préparation de l'audio{{ engine === 'online' ? '' : ' et détection de la parole' }}...</template>
                 <template v-else-if="processingPhase === 'loading'">Chargement du modèle IA...</template>
                 <template v-else-if="processingPhase === 'downloading'">
                   Téléchargement du modèle IA
                   <span class="text-ink-500">({{ Math.round(modelDownloadProgress) }} %)</span>
                 </template>
                 <template v-else>
-                  Génération des sous-titres
+                  {{ engine === 'online' ? 'Transcription en ligne' : 'Génération des sous-titres' }}
                   <span class="text-ink-500">
                     ({{ progressPercent }} %<template v-if="etaSeconds !== null"> &middot; {{ formatEta(etaSeconds) }} restantes</template>)
                   </span>
@@ -447,6 +463,9 @@ onBeforeUnmount(() => {
             <p class="flex items-center gap-2 text-sm text-ink-600">
               <AppIcon name="check" class="h-4 w-4 text-brand-600" />
               {{ !subtitles.length ? 'Aucune parole détectée dans cette vidéo.' : restoredFromCache ? 'Sous-titres restaurés depuis le cache local.' : 'Sous-titres prêts.' }}
+              <span v-if="subtitles.length" class="rounded-full bg-ink-100 px-2 py-0.5 text-xs text-ink-700">
+                {{ LANGUAGE_LABELS[outputLanguage] }}
+              </span>
             </p>
             <div v-if="subtitles.length" class="flex gap-2">
               <button class="btn-secondary !px-3 !py-1.5" @click="exportSubtitles('srt')">
@@ -458,9 +477,20 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <p v-if="status === 'error'" class="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">
-            {{ errorMessage }}
-          </p>
+          <div v-if="status === 'error'" class="flex flex-col gap-3 rounded-xl bg-red-50 px-4 py-3">
+            <p class="text-sm text-red-700">{{ errorMessage }}</p>
+            <div class="flex flex-wrap gap-2">
+              <button v-if="errorKind === 'auth'" class="btn-secondary !px-3 !py-1.5" @click="backToSettings">Modifier la clé</button>
+              <button v-else-if="engine === 'online'" class="btn-secondary !px-3 !py-1.5" @click="retryGeneration">Réessayer</button>
+              <button v-if="canContinueLocally" class="btn-primary !px-3 !py-1.5" @click="continueInLocal">
+                Terminer en local (anglais)
+              </button>
+              <button v-if="engine === 'local' || errorKind === 'auth'" class="btn-secondary !px-3 !py-1.5" @click="backToSettings">Retour aux réglages</button>
+            </div>
+            <p v-if="canContinueLocally" class="text-xs text-red-700/80">
+              Les sous-titres déjà obtenus sont conservés ; la suite sera générée en anglais, sur votre appareil.
+            </p>
+          </div>
         </div>
       </template>
     </div>

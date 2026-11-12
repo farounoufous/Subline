@@ -38,6 +38,9 @@ function formatDuration(seconds) {
         <img v-if="entry.thumbnailDataUrl" :src="entry.thumbnailDataUrl" alt="" class="aspect-video w-full bg-ink-100 object-cover" />
         <div class="flex flex-col gap-1 p-3">
           <p class="truncate text-sm font-medium text-ink-900" :title="entry.fileName">{{ entry.fileName }}</p>
+          <span v-if="entry.language" class="w-fit rounded-full bg-ink-100 px-2 py-0.5 text-xs text-ink-700">
+            {{ entry.language === 'fr' ? 'Français' : entry.language === 'mixed' ? 'Français puis English' : 'English' }}
+          </span>
           <div class="flex items-center justify-between text-xs text-ink-500">
             <span class="tabular-nums">{{ formatDuration(entry.durationSeconds) }}</span>
             <button class="flex items-center gap-1 hover:text-red-600" @click="remove(entry.fingerprint)">

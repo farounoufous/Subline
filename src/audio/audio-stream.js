@@ -38,8 +38,17 @@ async function createVad() {
   })
 }
 
-async function loadFfmpeg(file) {
+/**
+ * Ouvre un fichier vidéo dans ffmpeg.wasm (sans le copier en mémoire).
+ * Partagé par le mode local (PCM + VAD) et le mode en ligne (MP3).
+ *
+ * @returns {Promise<{ ffmpeg: FFmpeg, close: () => void }>}
+ */
+export async function openMediaSource(file, signal) {
   const ffmpeg = new FFmpeg()
+  const abort = () => ffmpeg.terminate()
+  signal?.addEventListener('abort', abort)
+
   await ffmpeg.load({
     coreURL: '/ffmpeg/ffmpeg-core.js',
     wasmURL: '/ffmpeg/ffmpeg-core.wasm'
@@ -48,7 +57,46 @@ async function loadFfmpeg(file) {
   // Un File enveloppant le fichier d'origine : WORKERFS le lit à la
   // demande, sans le charger en mémoire.
   await ffmpeg.mount('WORKERFS', { files: [new File([file], SOURCE_NAME)] }, MOUNT_DIR)
-  return ffmpeg
+
+  return {
+    ffmpeg,
+    close() {
+      signal?.removeEventListener('abort', abort)
+      ffmpeg.terminate()
+    }
+  }
+}
+
+// Débit de l'audio envoyé en ligne : suffisant pour la parole, et ~14 Mo
+// par heure de vidéo (contre plusieurs centaines de Mo pour la vidéo).
+export const ONLINE_AUDIO_BITRATE_KBPS = 32
+
+/**
+ * Extrait [start, start + length) en MP3 mono 16 kHz, à débit constant.
+ * La durée réelle se déduit de la taille : octets * 8 / débit.
+ *
+ * @returns {Promise<{ blob: Blob, seconds: number }>}
+ */
+export async function extractCompressedChunk(ffmpeg, start, length) {
+  const outputName = 'chunk.mp3'
+  const exitCode = await ffmpeg.exec([
+    '-ss', String(start),
+    '-t', String(length),
+    '-i', `${MOUNT_DIR}/${SOURCE_NAME}`,
+    '-vn', '-sn',
+    '-ac', '1',
+    '-ar', String(TARGET_SAMPLE_RATE),
+    '-c:a', 'libmp3lame',
+    '-b:a', `${ONLINE_AUDIO_BITRATE_KBPS}k`,
+    '-y', outputName
+  ])
+
+  if (exitCode !== 0) return { blob: new Blob([]), seconds: 0, exitCode }
+
+  const bytes = await ffmpeg.readFile(outputName)
+  await ffmpeg.deleteFile(outputName)
+  const seconds = (bytes.byteLength * 8) / (ONLINE_AUDIO_BITRATE_KBPS * 1000)
+  return { blob: new Blob([bytes], { type: 'audio/mpeg' }), seconds, exitCode }
 }
 
 // Extrait [start, start + length) en 16 kHz mono PCM 16 bits.
@@ -115,7 +163,7 @@ function splitIfTooLong(segment) {
  * segment possédé se termine, pour qu'aucune phrase ne soit coupée.
  *
  * @param {File} file
- * @param {{ durationHint?: number, signal?: AbortSignal }} options
+ * @param {{ durationHint?: number, signal?: AbortSignal, startAt?: number }} options  startAt : reprise à partir de cet instant (secondes)
  * @yields {{
  *   segments: { audio: Float32Array, startTime: number, endTime: number }[],
  *   horizon: number,            // instant jusqu'auquel l'audio est analysé
@@ -123,17 +171,16 @@ function splitIfTooLong(segment) {
  *   analyzedSeconds: number     // durée analysée dans ce morceau
  * }}
  */
-export async function* streamAudioSegments(file, { durationHint, signal } = {}) {
-  const ffmpeg = await loadFfmpeg(file)
-  const abort = () => ffmpeg.terminate()
-  signal?.addEventListener('abort', abort)
+export async function* streamAudioSegments(file, { durationHint, signal, startAt = 0 } = {}) {
+  const source = await openMediaSource(file, signal)
+  const { ffmpeg } = source
 
   try {
     const vad = await createVad()
     const windowLength = STREAM_CHUNK_SECONDS + STREAM_LOOKAHEAD_SECONDS
     const knownDuration = Number.isFinite(durationHint) && durationHint > 0
 
-    let cursor = 0
+    let cursor = startAt
     let producedAudio = false
 
     while (true) {
@@ -176,7 +223,6 @@ export async function* streamAudioSegments(file, { durationHint, signal } = {}) 
       cursor = horizon
     }
   } finally {
-    signal?.removeEventListener('abort', abort)
-    ffmpeg.terminate()
+    source.close()
   }
 }
