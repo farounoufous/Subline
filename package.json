@@ -1,5 +1,5 @@
 {
-  "name": "pwa-sous-titrage-local",
+  "name": "subline",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,9 +9,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
     "@huggingface/transformers": "^3.0.0",
     "@ricky0123/vad-web": "^0.0.30",
-    "vue": "^3.4.0"
+    "vue": "^3.4.0",
+    "onnxruntime-web": "1.22.0-dev.20250409-89f8206ba4"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.0",
@@ -19,5 +23,8 @@
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.3",
     "vite": "^5.2.0"
+  },
+  "overrides": {
+    "onnxruntime-web": "$onnxruntime-web"
   }
 }

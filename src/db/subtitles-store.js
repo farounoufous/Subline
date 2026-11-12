@@ -7,9 +7,12 @@
 // que d'afficher des sous-titres produits par une logique périmée.
 
 const DB_NAME = 'sous-titrage-local'
-const DB_VERSION = 1
+const DB_VERSION = 2
 const STORE_NAME = 'processedVideos'
-const CACHE_FORMAT_VERSION = 4
+// Progression d'un traitement interrompu, segment par segment, pour
+// pouvoir le reprendre sans tout recalculer.
+const PARTIALS_STORE_NAME = 'partialProgress'
+const CACHE_FORMAT_VERSION = 5
 
 function openDatabase() {
   return new Promise((resolve, reject) => {
@@ -20,6 +23,9 @@ function openDatabase() {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'fingerprint' })
       }
+      if (!db.objectStoreNames.contains(PARTIALS_STORE_NAME)) {
+        db.createObjectStore(PARTIALS_STORE_NAME, { keyPath: 'key' })
+      }
     }
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error)
@@ -27,12 +33,12 @@ function openDatabase() {
 }
 
 // Exécute une opération sur le store et attend la fin de la transaction.
-async function withStore(mode, operation) {
+async function withStore(mode, operation, storeName = STORE_NAME) {
   const db = await openDatabase()
   try {
     return await new Promise((resolve, reject) => {
-      const transaction = db.transaction(STORE_NAME, mode)
-      const store = transaction.objectStore(STORE_NAME)
+      const transaction = db.transaction(storeName, mode)
+      const store = transaction.objectStore(storeName)
       const request = operation(store)
 
       transaction.oncomplete = () => resolve(request?.result)
@@ -68,4 +74,27 @@ export async function getAllProcessedVideos() {
 
 export async function deleteProcessedVideo(fingerprint) {
   await withStore('readwrite', (store) => store.delete(fingerprint))
+}
+
+// --- Progression partielle (reprise après interruption) ---
+
+// Clé : empreinte du fichier + mode, car la progression d'une
+// transcription n'est pas réutilisable pour une traduction.
+export const partialKey = (fingerprint, mode) => `${fingerprint}::${mode}`
+
+export async function getPartialProgress(key) {
+  const entry = await withStore('readonly', (store) => store.get(key), PARTIALS_STORE_NAME)
+  if (!entry || entry.formatVersion !== CACHE_FORMAT_VERSION) {
+    return null
+  }
+  return entry
+}
+
+export async function savePartialProgress(key, segments) {
+  const plain = JSON.parse(JSON.stringify({ key, segments, formatVersion: CACHE_FORMAT_VERSION, updatedAt: Date.now() }))
+  await withStore('readwrite', (store) => store.put(plain), PARTIALS_STORE_NAME)
+}
+
+export async function deletePartialProgress(key) {
+  await withStore('readwrite', (store) => store.delete(key), PARTIALS_STORE_NAME)
 }

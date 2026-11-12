@@ -1,21 +1,39 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
-import { decodeAudioSegments } from '../audio/audio-decode.js'
-import { runInferencePool } from '../workers/worker-pool.js'
+import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { computeFingerprint } from '../utils/fingerprint.js'
 import { captureThumbnail } from '../utils/thumbnail.js'
-import { formatClause, applyReadingTiming } from '../utils/subtitle-format.js'
+import { toSrt, toVtt, downloadTextFile } from '../utils/subtitle-export.js'
 import { getProcessedVideo, saveProcessedVideo } from '../db/subtitles-store.js'
 import { useVideoHistory } from '../db/useVideoHistory.js'
-import { toSrt, toVtt, downloadTextFile } from '../utils/subtitle-export.js'
-import { READY_THRESHOLD_SECONDS, MODEL_DOWNLOAD_SIZE_LABEL } from '../audio/constants.js'
+import { useSubtitleGeneration } from '../composables/useSubtitleGeneration.js'
+import { MODEL_DOWNLOAD_SIZE_LABEL } from '../audio/constants.js'
 import AppIcon from './ui/AppIcon.vue'
+import TranscriptPanel from './TranscriptPanel.vue'
 
 // Langue de la vidéo : 'english' (transcription) ou 'translate'
 // (traduction vers l'anglais). Mémorisée comme simple confort.
-const SOURCE_MODE_STORAGE_KEY = 'sous-titreur:source-mode'
+const SOURCE_MODE_STORAGE_KEY = 'subline:source-mode'
+const SOURCE_OPTIONS = [
+  { value: 'english', label: 'Anglais' },
+  { value: 'translate', label: 'Autre langue (traduire en anglais)' }
+]
 
 const { refresh: refreshHistory } = useVideoHistory()
+const generation = useSubtitleGeneration()
+const {
+  status,
+  errorMessage,
+  processingPhase,
+  modelDownloadProgress,
+  subtitles,
+  readyUpToTime,
+  totalDuration,
+  playbackUnlocked,
+  silenceSkippedSeconds,
+  etaSeconds,
+  progressPercent,
+  partialInfo
+} = generation
 
 const playerContainerRef = ref(null)
 const videoRef = ref(null)
@@ -23,20 +41,17 @@ const videoSrc = ref(null)
 const fileName = ref('')
 const isDraggingOver = ref(false)
 const isFullscreen = ref(false)
-
-// 'idle' | 'processing' | 'ready' | 'error'
-const status = ref('idle')
-const errorMessage = ref('')
-const subtitles = ref([])
-const progress = ref({ done: 0, total: 0 })
-const silenceSkippedSeconds = ref(0)
-const activeSubtitleText = ref('')
 const restoredFromCache = ref(false)
+const showCatchUpPrompt = ref(false)
+
+const activeIndex = ref(-1)
+const activeSubtitleText = ref('')
+// Décalage manuel de l'affichage des sous-titres (secondes).
+const subtitleOffset = ref(0)
 
 function readStoredSourceMode() {
   try {
-    const stored = localStorage.getItem(SOURCE_MODE_STORAGE_KEY)
-    return stored === 'translate' ? 'translate' : 'english'
+    return localStorage.getItem(SOURCE_MODE_STORAGE_KEY) === 'translate' ? 'translate' : 'english'
   } catch {
     return 'english'
   }
@@ -53,40 +68,15 @@ function setSourceMode(mode) {
   }
 }
 
-function exportSubtitles(format) {
-  const baseName = (fileName.value || 'sous-titres').replace(/\.[^.]+$/, '')
-  if (format === 'srt') {
-    downloadTextFile(toSrt(subtitles.value), `${baseName}.en.srt`, 'application/x-subrip')
-  } else {
-    downloadTextFile(toVtt(subtitles.value), `${baseName}.en.vtt`, 'text/vtt')
-  }
-}
-
-// Phase affichée pendant status === 'processing'.
-// 'decoding' | 'loading' | 'downloading' | 'generating'
-const processingPhase = ref('decoding')
-const modelDownloadProgress = ref(0)
-
-// Déblocage progressif : la vidéo devient "regardable" dès qu'une
-// portion suffisante (READY_THRESHOLD_SECONDS) est prête depuis le
-// début, sans attendre la génération complète.
-const playbackUnlocked = ref(false)
-const readyUpToTime = ref(0)
-const totalDuration = ref(0)
-const showCatchUpPrompt = ref(false)
-
 let objectUrl = null
 let currentFile = null
-let activePool = null
 let currentFingerprint = null
-let segmentsForProgress = []
-let segmentDoneFlags = []
 let bypassCatchUpCheck = false
 
+// --- Lecture et sous-titre actif ---
+
 function toggleVideoPlayback() {
-  if (!videoRef.value) {
-    return
-  }
+  if (!videoRef.value) return
   if (videoRef.value.paused) {
     videoRef.value.play()
   } else {
@@ -94,22 +84,30 @@ function toggleVideoPlayback() {
   }
 }
 
-function onTimeUpdate() {
-  if (!videoRef.value) {
-    return
-  }
-  const currentTime = videoRef.value.currentTime
-  const active = subtitles.value.find((s) => currentTime >= s.startTime && currentTime < s.endTime)
-  activeSubtitleText.value = active ? active.text : ''
+function updateActiveSubtitle() {
+  if (!videoRef.value) return
+  const time = videoRef.value.currentTime - subtitleOffset.value
+  const index = subtitles.value.findIndex((s) => time >= s.startTime && time < s.endTime)
+  activeIndex.value = index
+  activeSubtitleText.value = index >= 0 ? subtitles.value[index].text : ''
+}
 
-  const stillProcessing = status.value === 'processing'
-  const pastReadyPoint = currentTime > readyUpToTime.value + 0.5
+function onTimeUpdate() {
+  if (!videoRef.value) return
+  updateActiveSubtitle()
+
+  const pastReadyPoint = videoRef.value.currentTime > readyUpToTime.value + 0.5
   const notFullyDone = readyUpToTime.value < totalDuration.value
 
-  if (stillProcessing && !bypassCatchUpCheck && pastReadyPoint && notFullyDone) {
+  if (status.value === 'processing' && !bypassCatchUpCheck && pastReadyPoint && notFullyDone) {
     videoRef.value.pause()
     showCatchUpPrompt.value = true
   }
+}
+
+function seekToSubtitle(subtitle) {
+  if (!videoRef.value) return
+  videoRef.value.currentTime = Math.max(0, subtitle.startTime + subtitleOffset.value)
 }
 
 function continueWithoutSubtitles() {
@@ -134,37 +132,42 @@ function onFullscreenChange() {
   isFullscreen.value = document.fullscreenElement === playerContainerRef.value
 }
 
-function recomputeReadyUpTo() {
-  let i = 0
-  while (i < segmentDoneFlags.length && segmentDoneFlags[i]) {
-    i++
-  }
-
-  if (i === 0) {
-    readyUpToTime.value = 0
-  } else if (i === segmentDoneFlags.length) {
-    readyUpToTime.value = totalDuration.value
-  } else {
-    readyUpToTime.value = segmentsForProgress[i - 1].endTime
-  }
-
-  if (!playbackUnlocked.value && readyUpToTime.value >= Math.min(READY_THRESHOLD_SECONDS, totalDuration.value)) {
-    playbackUnlocked.value = true
-  }
-
-  if (showCatchUpPrompt.value && videoRef.value && readyUpToTime.value > videoRef.value.currentTime) {
+// Reprise automatique de la lecture quand la génération rattrape le
+// point de lecture après une pause d'attente.
+watch(readyUpToTime, (ready) => {
+  if (showCatchUpPrompt.value && videoRef.value && ready > videoRef.value.currentTime) {
     showCatchUpPrompt.value = false
     videoRef.value.play()
   }
+})
+
+watch(subtitleOffset, updateActiveSubtitle)
+watch(subtitles, updateActiveSubtitle)
+
+// --- Export ---
+
+function exportSubtitles(format) {
+  const shifted = subtitles.value.map((s) => ({
+    ...s,
+    startTime: Math.max(0, s.startTime + subtitleOffset.value),
+    endTime: Math.max(0, s.endTime + subtitleOffset.value)
+  }))
+  const baseName = (fileName.value || 'subline').replace(/\.[^.]+$/, '')
+
+  if (format === 'srt') {
+    downloadTextFile(toSrt(shifted), `${baseName}.en.srt`, 'application/x-subrip')
+  } else {
+    downloadTextFile(toVtt(shifted), `${baseName}.en.vtt`, 'text/vtt')
+  }
 }
+
+// --- Cache et génération ---
 
 async function checkCache(fingerprint) {
   const cached = await getProcessedVideo(fingerprint)
-  if (!cached || fingerprint !== currentFingerprint) {
-    return
-  }
-  subtitles.value = cached.subtitles
-  status.value = 'ready'
+  if (!cached || fingerprint !== currentFingerprint) return
+
+  generation.restoreFromCache(cached)
   restoredFromCache.value = true
 
   try {
@@ -175,12 +178,9 @@ async function checkCache(fingerprint) {
 }
 
 async function persistResult(fingerprint, file) {
-  if (fingerprint !== currentFingerprint) {
-    return
-  }
+  if (fingerprint !== currentFingerprint) return
 
   const thumbnailDataUrl = await captureThumbnail(objectUrl)
-
   await saveProcessedVideo({
     fingerprint,
     fileName: file.name,
@@ -190,23 +190,24 @@ async function persistResult(fingerprint, file) {
     thumbnailDataUrl,
     createdAt: Date.now()
   })
-
   await refreshHistory()
 }
 
-async function generateSubtitles() {
-  if (!currentFile || status.value === 'processing') {
-    return
-  }
+async function refreshPartialInfo() {
+  if (!currentFingerprint || status.value !== 'idle') return
+  await generation.checkPartial(currentFingerprint, sourceMode.value, videoRef.value?.duration || 0)
+}
 
-  status.value = 'processing'
-  processingPhase.value = 'decoding'
-  modelDownloadProgress.value = 0
-  subtitles.value = []
-  progress.value = { done: 0, total: 0 }
+function onLoadedMetadata() {
+  refreshPartialInfo()
+}
+
+watch(sourceMode, refreshPartialInfo)
+
+async function generateSubtitles() {
+  if (!currentFile || status.value === 'processing') return
+
   restoredFromCache.value = false
-  playbackUnlocked.value = false
-  readyUpToTime.value = 0
   showCatchUpPrompt.value = false
   bypassCatchUpCheck = false
 
@@ -214,45 +215,14 @@ async function generateSubtitles() {
   const file = currentFile
 
   try {
-    const { segments, totalDuration: duration, silenceSkippedSeconds: skipped } = await decodeAudioSegments(file)
-    progress.value.total = segments.length
-    silenceSkippedSeconds.value = skipped
-    segmentsForProgress = segments
-    segmentDoneFlags = new Array(segments.length).fill(false)
-    totalDuration.value = duration
-
-    processingPhase.value = 'loading'
-
-    activePool = runInferencePool(segments, sourceMode.value, {
-      onModelProgress: (percent) => {
-        modelDownloadProgress.value = percent
-        processingPhase.value = 'downloading'
-      },
-      onModelsReady: () => {
-        processingPhase.value = 'generating'
-      },
-      onSubtitle: (subtitle) => {
-        subtitles.value.push(...formatClause(subtitle))
-        subtitles.value.sort((a, b) => a.startTime - b.startTime)
-        applyReadingTiming(subtitles.value)
-      },
-      onSegmentDone: (segmentIndex) => {
-        segmentDoneFlags[segmentIndex] = true
-        progress.value = { done: progress.value.done + 1, total: progress.value.total }
-        recomputeReadyUpTo()
-      },
-      onError: (message) => {
-        console.error('Erreur du worker d\'inférence :', message)
-      }
+    const result = await generation.start(file, {
+      fingerprint,
+      mode: sourceMode.value,
+      durationHint: videoRef.value?.duration
     })
-
-    await activePool.promise
-    status.value = 'ready'
-    playbackUnlocked.value = true
-    readyUpToTime.value = totalDuration.value
+    if (result === null) return // annulée (autre vidéo chargée)
   } catch (error) {
-    status.value = 'error'
-    errorMessage.value = `Impossible de décoder l'audio de cette vidéo : ${error.message}`
+    console.error('Échec de la génération :', error)
     return
   }
 
@@ -265,39 +235,31 @@ async function generateSubtitles() {
 
 function loadFile(file) {
   if (!file || !file.type.startsWith('video/')) {
-    console.warn('Fichier ignoré : ce n\'est pas une vidéo.', file?.type)
+    console.warn("Fichier ignoré : ce n'est pas une vidéo.", file?.type)
     return
   }
 
-  if (activePool) {
-    activePool.cancel()
-    activePool = null
-  }
-
-  if (objectUrl) {
-    URL.revokeObjectURL(objectUrl)
-  }
+  generation.reset()
+  if (objectUrl) URL.revokeObjectURL(objectUrl)
 
   objectUrl = URL.createObjectURL(file)
   currentFile = file
   currentFingerprint = computeFingerprint(file)
   videoSrc.value = objectUrl
   fileName.value = file.name
-  subtitles.value = []
-  status.value = 'idle'
+  activeIndex.value = -1
   activeSubtitleText.value = ''
   restoredFromCache.value = false
-  playbackUnlocked.value = false
-  readyUpToTime.value = 0
-  totalDuration.value = 0
   showCatchUpPrompt.value = false
   bypassCatchUpCheck = false
+  subtitleOffset.value = 0
 
   checkCache(currentFingerprint)
 }
 
 function onFileInputChange(event) {
   loadFile(event.target.files[0])
+  event.target.value = ''
 }
 
 function onDrop(event) {
@@ -306,25 +268,27 @@ function onDrop(event) {
   loadFile(event.dataTransfer.files[0])
 }
 
+function formatEta(seconds) {
+  if (seconds === null || seconds === undefined) return ''
+  if (seconds < 60) return "moins d'une minute"
+  return `environ ${Math.round(seconds / 60)} min`
+}
+
 onMounted(() => {
   document.addEventListener('fullscreenchange', onFullscreenChange)
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', onFullscreenChange)
-  if (activePool) {
-    activePool.cancel()
-  }
-  if (objectUrl) {
-    URL.revokeObjectURL(objectUrl)
-  }
+  generation.cancel()
+  if (objectUrl) URL.revokeObjectURL(objectUrl)
 })
 </script>
 
 <template>
-  <div class="flex flex-col gap-4">
+  <div class="grid gap-6" :class="videoSrc ? 'lg:grid-cols-[minmax(0,1fr)_22rem]' : ''">
     <div
-      class="overflow-hidden rounded-2xl border bg-white shadow-card transition-colors"
+      class="self-start overflow-hidden rounded-2xl border bg-white shadow-card transition-colors"
       :class="isDraggingOver ? 'border-brand-500' : 'border-ink-200'"
       @dragover.prevent="isDraggingOver = true"
       @dragleave.prevent="isDraggingOver = false"
@@ -360,6 +324,7 @@ onBeforeUnmount(() => {
             class="block w-full bg-black"
             :class="isFullscreen ? 'h-screen object-contain' : 'max-h-[70vh]'"
             @timeupdate="onTimeUpdate"
+            @loadedmetadata="onLoadedMetadata"
             @click="toggleVideoPlayback"
           ></video>
 
@@ -409,7 +374,7 @@ onBeforeUnmount(() => {
               <p class="text-sm font-medium text-ink-900">Langue parlée dans la vidéo</p>
               <div class="mt-2 inline-flex rounded-lg border border-ink-200 bg-white p-1" role="radiogroup" aria-label="Langue parlée dans la vidéo">
                 <button
-                  v-for="option in [{ value: 'english', label: 'Anglais' }, { value: 'translate', label: 'Autre langue (traduire en anglais)' }]"
+                  v-for="option in SOURCE_OPTIONS"
                   :key="option.value"
                   role="radio"
                   :aria-checked="sourceMode === option.value"
@@ -425,7 +390,12 @@ onBeforeUnmount(() => {
               Les sous-titres sont générés en anglais, entièrement en local. Au premier usage, le modèle IA
               ({{ MODEL_DOWNLOAD_SIZE_LABEL }}) est téléchargé, puis conservé pour un usage hors ligne.
             </p>
-            <button class="btn-primary self-start" @click="generateSubtitles">Générer les sous-titres</button>
+            <p v-if="partialInfo" class="rounded-lg bg-brand-50 px-3 py-2 text-sm text-brand-900">
+              Une génération interrompue a été retrouvée ({{ partialInfo.percent }} % déjà traité). Elle sera reprise là où elle s'est arrêtée.
+            </p>
+            <button class="btn-primary self-start" @click="generateSubtitles">
+              {{ partialInfo ? 'Reprendre la génération' : 'Générer les sous-titres' }}
+            </button>
           </div>
 
           <!-- Traitement en cours -->
@@ -437,7 +407,7 @@ onBeforeUnmount(() => {
 
             <div class="flex flex-col gap-1.5">
               <p class="text-sm text-ink-700">
-                <template v-if="processingPhase === 'decoding'">Décodage de la vidéo et détection de la parole...</template>
+                <template v-if="processingPhase === 'decoding'">Préparation de l'audio et détection de la parole...</template>
                 <template v-else-if="processingPhase === 'loading'">Chargement du modèle IA...</template>
                 <template v-else-if="processingPhase === 'downloading'">
                   Téléchargement du modèle IA
@@ -445,7 +415,9 @@ onBeforeUnmount(() => {
                 </template>
                 <template v-else>
                   Génération des sous-titres
-                  <span class="text-ink-500">({{ progress.total ? Math.round((progress.done / progress.total) * 100) : 0 }} %)</span>
+                  <span class="text-ink-500">
+                    ({{ progressPercent }} %<template v-if="etaSeconds !== null"> &middot; {{ formatEta(etaSeconds) }} restantes</template>)
+                  </span>
                 </template>
               </p>
 
@@ -457,7 +429,7 @@ onBeforeUnmount(() => {
                 <div
                   v-else
                   class="h-full rounded-full bg-brand-600 transition-[width] duration-300"
-                  :style="{ width: (processingPhase === 'downloading' ? Math.round(modelDownloadProgress) : Math.round((progress.done / (progress.total || 1)) * 100)) + '%' }"
+                  :style="{ width: (processingPhase === 'downloading' ? Math.round(modelDownloadProgress) : progressPercent) + '%' }"
                 ></div>
               </div>
 
@@ -474,7 +446,7 @@ onBeforeUnmount(() => {
           <div v-if="status === 'ready'" class="flex flex-wrap items-center justify-between gap-3">
             <p class="flex items-center gap-2 text-sm text-ink-600">
               <AppIcon name="check" class="h-4 w-4 text-brand-600" />
-              {{ restoredFromCache ? 'Sous-titres restaurés depuis le cache local.' : 'Sous-titres prêts.' }}
+              {{ !subtitles.length ? 'Aucune parole détectée dans cette vidéo.' : restoredFromCache ? 'Sous-titres restaurés depuis le cache local.' : 'Sous-titres prêts.' }}
             </p>
             <div v-if="subtitles.length" class="flex gap-2">
               <button class="btn-secondary !px-3 !py-1.5" @click="exportSubtitles('srt')">
@@ -492,6 +464,14 @@ onBeforeUnmount(() => {
         </div>
       </template>
     </div>
+
+    <TranscriptPanel
+      v-if="videoSrc"
+      v-model:offset="subtitleOffset"
+      :subtitles="subtitles"
+      :active-index="activeIndex"
+      @seek="seekToSubtitle"
+    />
   </div>
 </template>
 

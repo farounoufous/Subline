@@ -23,7 +23,7 @@ const badges = ['100% local', 'Fonctionne hors ligne', 'Aucun envoi de données'
         </p>
 
         <div class="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
-          <a href="#application" class="btn-primary px-6 py-3">
+          <a href="/app.html" class="btn-primary px-6 py-3">
             Sous-titrer une vidéo
             <AppIcon name="arrowRight" class="h-4 w-4" />
           </a>

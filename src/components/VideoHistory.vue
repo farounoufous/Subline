@@ -33,7 +33,7 @@ function formatDuration(seconds) {
       Aucune pour l'instant.
     </p>
 
-    <ul class="mt-4 flex flex-col gap-3">
+    <ul class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <li v-for="entry in entries" :key="entry.fingerprint" class="overflow-hidden rounded-xl border border-ink-200">
         <img v-if="entry.thumbnailDataUrl" :src="entry.thumbnailDataUrl" alt="" class="aspect-video w-full bg-ink-100 object-cover" />
         <div class="flex flex-col gap-1 p-3">

@@ -28,3 +28,11 @@ export const CLAUSE_PAUSE_GAP_SECONDS = 0.6
 
 // Taille approximative du modèle Whisper téléchargé au premier usage.
 export const MODEL_DOWNLOAD_SIZE_LABEL = '~260 Mo'
+
+// Décodage audio en flux : la piste est extraite et analysée par
+// morceaux (STREAM_CHUNK_SECONDS), ce qui évite de charger tout l'audio
+// en mémoire et permet de commencer à transcrire dès le premier morceau.
+// Chaque morceau est décodé avec un surplus (STREAM_LOOKAHEAD_SECONDS)
+// pour ne pas couper en deux une phrase qui chevauche la frontière.
+export const STREAM_CHUNK_SECONDS = 5 * 60
+export const STREAM_LOOKAHEAD_SECONDS = 20

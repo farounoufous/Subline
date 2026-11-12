@@ -3,22 +3,24 @@
 // hors-ligne. La mise en cache des poids du modèle IA (Whisper) est
 // gérée séparément par transformers.js, pas ici.
 
-const CACHE_NAME = 'app-shell-v3'
+const CACHE_NAME = 'app-shell-v5'
 
 // Liste explicite plutôt que découverte dynamique : on sait exactement
 // ce qui doit être disponible hors-ligne, pas de surprise au runtime.
 const APP_SHELL_FILES = [
   '/',
   '/index.html',
+  '/app.html',
   '/manifest.json',
   '/icons/icon-192.png',
-  '/icons/icon-512.png',
-  '/onnx-runtime/ort-wasm-simd-threaded.jsep.mjs',
-  '/onnx-runtime/ort-wasm-simd-threaded.jsep.wasm',
-  '/vad-assets/silero_vad_legacy.onnx',
-  '/vad-assets/ort-wasm-simd-threaded.mjs',
-  '/vad-assets/ort-wasm-simd-threaded.wasm'
+  '/icons/icon-512.png'
 ]
+
+// Les fichiers lourds (runtimes WASM d'ONNX et de ffmpeg, modèle VAD)
+// ne sont volontairement PAS pré-chargés ici : un simple visiteur de la
+// page d'accueil n'a pas à télécharger des dizaines de Mo. Ils sont mis
+// en cache à la demande, lors de la première génération de
+// sous-titres, par le gestionnaire fetch ci-dessous.
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -54,6 +56,13 @@ self.addEventListener('fetch', (event) => {
   // et autres schémas non standards ne sont pas cachables et feraient
   // échouer cache.put().
   if (event.request.method !== 'GET' || !event.request.url.startsWith('http')) {
+    return
+  }
+
+  // Uniquement les fichiers de l'app elle-même : les poids du modèle
+  // (Hugging Face) ont leur propre cache géré par transformers.js, les
+  // dupliquer ici doublerait inutilement le stockage.
+  if (new URL(event.request.url).origin !== self.location.origin) {
     return
   }
 

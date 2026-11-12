@@ -1,8 +1,8 @@
 {
-  "name": "Sous-titreur",
-  "short_name": "Sous-titreur",
+  "name": "Subline",
+  "short_name": "Subline",
   "description": "Sous-titres anglais générés localement avec Whisper, utilisables hors ligne.",
-  "start_url": "/",
+  "start_url": "/app.html",
   "scope": "/",
   "display": "standalone",
   "background_color": "#ffffff",

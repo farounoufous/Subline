@@ -211,7 +211,7 @@ self.onmessage = (event) => {
     // message arrive plusieurs fois par erreur.
     if (!modelsReady) {
       modelsReady = loadModels().catch((error) => {
-        self.postMessage({ type: 'ERROR', message: `Échec du chargement des modèles : ${error.message}` })
+        self.postMessage({ type: 'ERROR', fatal: true, message: `Échec du chargement du modèle : ${error.message}` })
         throw error
       })
     }
