@@ -1,7 +1,8 @@
 <script setup>
 import AppIcon from '../ui/AppIcon.vue'
+import { t } from '../../i18n/index.js'
 
-const badges = ['100% local', 'Fonctionne hors ligne', 'Aucun envoi de données']
+const badgeKeys = ['hero.badge1', 'hero.badge2', 'hero.badge3']
 </script>
 
 <template>
@@ -13,27 +14,26 @@ const badges = ['100% local', 'Fonctionne hors ligne', 'Aucun envoi de données'
 
     <div class="mx-auto max-w-6xl px-6 pb-20 pt-16 sm:pt-24">
       <div class="mx-auto max-w-3xl text-center">
-        <p class="eyebrow">Sous-titrage automatique, entièrement dans votre navigateur</p>
+        <p class="eyebrow">{{ t('hero.eyebrow') }}</p>
         <h1 class="mt-4 text-4xl font-semibold tracking-tight text-ink-900 sm:text-6xl">
-          Des sous-titres anglais pour toutes vos vidéos.
+          {{ t('hero.title') }}
         </h1>
         <p class="mx-auto mt-6 max-w-2xl text-lg text-ink-600">
-          Déposez une vidéo : l'intelligence artificielle l'écoute sur votre appareil, la transcrit
-          ou la traduit en anglais, et affiche les sous-titres en synchronisation. Rien ne quitte votre ordinateur.
+          {{ t('hero.lead') }}
         </p>
 
         <div class="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
           <a href="/app.html" class="btn-primary px-6 py-3">
-            Sous-titrer une vidéo
+            {{ t('hero.ctaPrimary') }}
             <AppIcon name="arrowRight" class="h-4 w-4" />
           </a>
-          <a href="#fonctionnement" class="btn-secondary px-6 py-3">Voir comment ça marche</a>
+          <a href="#fonctionnement" class="btn-secondary px-6 py-3">{{ t('hero.ctaSecondary') }}</a>
         </div>
 
         <ul class="mt-8 flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm text-ink-500">
-          <li v-for="badge in badges" :key="badge" class="flex items-center gap-1.5">
+          <li v-for="badge in badgeKeys" :key="badge" class="flex items-center gap-1.5">
             <AppIcon name="check" class="h-4 w-4 text-brand-600" />
-            {{ badge }}
+            {{ t(badge) }}
           </li>
         </ul>
       </div>

@@ -199,7 +199,7 @@ async function processOneSegment(segment, mode) {
       }
     }
   } catch (error) {
-    self.postMessage({ type: 'ERROR', message: `Échec de l'inférence sur un segment : ${error.message}` })
+    self.postMessage({ type: 'ERROR', message: `Segment inference failed: ${error.message}` })
   }
 
   self.postMessage({ type: 'SEGMENT_DONE' })
@@ -211,7 +211,7 @@ self.onmessage = (event) => {
     // message arrive plusieurs fois par erreur.
     if (!modelsReady) {
       modelsReady = loadModels().catch((error) => {
-        self.postMessage({ type: 'ERROR', fatal: true, message: `Échec du chargement du modèle : ${error.message}` })
+        self.postMessage({ type: 'ERROR', fatal: true, code: 'modelLoad', message: error.message })
         throw error
       })
     }

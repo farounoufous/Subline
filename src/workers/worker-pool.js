@@ -66,11 +66,13 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
     resolvePromise()
   }
 
-  function fail(message) {
+  function fail(message, code) {
     if (finished) return
     finished = true
     terminateAll()
-    rejectPromise(new Error(message))
+    const error = new Error(message)
+    error.code = code
+    rejectPromise(error)
   }
 
   function dispatch() {
@@ -125,7 +127,7 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
           dispatch()
         } else if (message.type === 'ERROR') {
           if (message.fatal) {
-            fail(message.message)
+            fail(message.message, message.code)
           } else {
             onError?.(message.message)
           }

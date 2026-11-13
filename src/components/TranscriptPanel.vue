@@ -1,6 +1,7 @@
 <script setup>
 import { ref, watch, nextTick } from 'vue'
 import AppIcon from './ui/AppIcon.vue'
+import { t } from '../i18n/index.js'
 
 const props = defineProps({
   subtitles: { type: Array, required: true },
@@ -60,30 +61,30 @@ watch(
     <header class="border-b border-ink-100 p-4">
       <div class="flex items-center gap-2">
         <AppIcon name="lines" class="h-4 w-4 text-ink-500" />
-        <h3 class="text-sm font-semibold text-ink-900">Transcription</h3>
+        <h3 class="text-sm font-semibold text-ink-900">{{ t('transcript.title') }}</h3>
         <span class="ml-auto text-xs tabular-nums text-ink-400">{{ subtitles.length }}</span>
       </div>
 
       <div class="mt-3 flex items-center justify-between gap-2 rounded-lg bg-ink-50 px-2 py-1.5">
-        <span class="text-xs text-ink-600">Décalage</span>
+        <span class="text-xs text-ink-600">{{ t('transcript.offset') }}</span>
         <div class="flex items-center gap-1">
           <button
             class="h-7 w-7 rounded-md border border-ink-200 bg-white text-sm text-ink-700 hover:bg-ink-100"
-            aria-label="Avancer les sous-titres de 0,5 seconde"
+            :aria-label="t('transcript.earlier')"
             @click="changeOffset(-OFFSET_STEP_SECONDS)"
           >
             -
           </button>
           <button
             class="w-16 text-center text-xs tabular-nums text-ink-800 hover:text-brand-600"
-            title="Réinitialiser"
+            :title="t('transcript.reset')"
             @click="emit('update:offset', 0)"
           >
             {{ formatOffset(offset) }}
           </button>
           <button
             class="h-7 w-7 rounded-md border border-ink-200 bg-white text-sm text-ink-700 hover:bg-ink-100"
-            aria-label="Retarder les sous-titres de 0,5 seconde"
+            :aria-label="t('transcript.later')"
             @click="changeOffset(OFFSET_STEP_SECONDS)"
           >
             +
@@ -93,7 +94,7 @@ watch(
     </header>
 
     <p v-if="!subtitles.length" class="p-6 text-center text-sm text-ink-500">
-      Les sous-titres apparaîtront ici au fur et à mesure de la génération.
+      {{ t('transcript.empty') }}
     </p>
 
     <ol v-else ref="listRef" class="relative min-h-0 flex-1 overflow-y-auto p-2">

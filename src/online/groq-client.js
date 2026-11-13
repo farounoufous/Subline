@@ -4,6 +4,8 @@
 // La clé API est celle de l'utilisateur, fournie depuis son navigateur ;
 // seul l'audio compressé (jamais la vidéo) est envoyé.
 
+import { t } from '../i18n/index.js'
+import { recordRateLimitHeaders, recordLimitFromMessage, parseRetryAfterSeconds } from './quota.js'
 const API_BASE = 'https://api.groq.com/openai/v1'
 
 export const TRANSCRIPTION_MODEL = 'whisper-large-v3'
@@ -91,23 +93,26 @@ async function groqFetch(path, buildInit, { apiKey, signal, modelErrors = false 
       })
     } catch (error) {
       if (error.name === 'AbortError') throw error
-      throw new OnlineError('network', 'Connexion au service en ligne impossible. Vérifiez votre connexion Internet.')
+      throw new OnlineError('network', t('err.network'))
     }
 
+    recordRateLimitHeaders(response.headers)
     if (response.ok) return response
 
     if (response.status === 401 || response.status === 403) {
-      throw new OnlineError('auth', 'Clé API refusée. Vérifiez qu\'elle est correcte et active.')
+      throw new OnlineError('auth', t('err.auth'))
     }
 
     if (response.status === 429) {
-      const retryAfter = Number(response.headers.get('retry-after')) || 0
+      const quotaMessage = await readErrorMessage(response.clone())
+      recordLimitFromMessage(quotaMessage)
+      const retryAfter = Number(response.headers.get('retry-after')) || parseRetryAfterSeconds(quotaMessage) || 0
       if (retryAfter > 0 && retryAfter <= MAX_RETRY_WAIT_SECONDS && rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
         rateLimitRetries++
         await sleep(retryAfter + 0.5, signal)
         continue
       }
-      throw new OnlineError('quota', 'Limite du quota gratuit atteinte.', { retryAfterSeconds: retryAfter || null })
+      throw new OnlineError('quota', t('err.quotaBase'), { retryAfterSeconds: retryAfter || null })
     }
 
     if (response.status >= 500 && serverErrorRetries < MAX_SERVER_ERROR_RETRIES) {
@@ -277,9 +282,9 @@ export function createTranslator({ apiKey, targetLanguage, signal }) {
       .trim()
     const parsed = JSON.parse(content)
     if (!Array.isArray(parsed.translations) || parsed.translations.length !== lines.length) {
-      throw new OnlineError('other', 'Réponse de traduction inattendue.')
+      throw new OnlineError('other', t('err.unexpectedTranslation'))
     }
-    return parsed.translations.map((t, i) => (typeof t === 'string' && t.trim() ? t.trim() : lines[i]))
+    return parsed.translations.map((item, i) => (typeof item === 'string' && item.trim() ? item.trim() : lines[i]))
   }
 
   // Un lot : passe au modèle suivant si le quota est atteint ou si le
@@ -300,7 +305,7 @@ export function createTranslator({ apiKey, targetLanguage, signal }) {
             continue
           }
           if (error.kind === 'model') {
-            throw new OnlineError('other', `Aucun modèle de traduction accessible avec cette clé (${error.message}).`)
+            throw new OnlineError('other', t('err.noModel', { detail: error.message }))
           }
           throw error
         }

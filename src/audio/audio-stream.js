@@ -11,6 +11,7 @@
 //  - les premiers segments sont disponibles après quelques secondes,
 //    sans attendre le décodage de tout le fichier.
 
+import { t } from '../i18n/index.js'
 import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { NonRealTimeVAD } from '@ricky0123/vad-web'
 import {
@@ -193,8 +194,8 @@ export async function* streamAudioSegments(file, { durationHint, signal, startAt
         if (!producedAudio) {
           throw new Error(
             exitCode !== 0
-              ? `Lecture du fichier impossible (code ${exitCode}).`
-              : 'Aucune piste audio exploitable dans cette vidéo.'
+              ? t('err.fileRead', { code: exitCode })
+              : t('err.noAudio')
           )
         }
         break

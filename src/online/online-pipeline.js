@@ -10,6 +10,8 @@
 // Aucune détection de silence préalable : Whisper large-v3 s'en charge et
 // le score no_speech_prob écarte les passages non fiables.
 
+import { t } from '../i18n/index.js'
+import { recordAudioSeconds } from './quota.js'
 import {
   openMediaSource,
   extractCompressedChunk
@@ -60,7 +62,7 @@ export async function runOnlinePipeline(file, { apiKey, targetLanguage, duration
         if (!producedAudio) {
           throw new OnlineError(
             'other',
-            exitCode !== 0 ? `Lecture du fichier impossible (code ${exitCode}).` : 'Aucune piste audio exploitable dans cette vidéo.'
+            exitCode !== 0 ? t('err.fileRead', { code: exitCode }) : t('err.noAudio')
           )
         }
         break
@@ -73,6 +75,7 @@ export async function runOnlinePipeline(file, { apiKey, targetLanguage, duration
 
       const { language, segments } = await transcribeChunk(blob, { apiKey, signal, prompt: previousText })
 
+      recordAudioSeconds(seconds)
       const absolute = segments.map((s) => ({ ...s, start: cursor + s.start, end: cursor + s.end }))
       const owned = reachedEnd ? absolute : absolute.filter((s) => s.start < ownedLimit)
       const lastOwnedEnd = owned.length > 0 ? owned[owned.length - 1].end : 0

@@ -1,0 +1,7 @@
+{
+  "name": "sharp",
+  "version": "0.34.5",
+  "description": "Stub vide : le traitement d image de Node est inutile dans le navigateur.",
+  "main": "index.js",
+  "license": "MIT"
+}

@@ -2,6 +2,7 @@
 import { onMounted } from 'vue'
 import { useVideoHistory } from '../db/useVideoHistory.js'
 import AppIcon from './ui/AppIcon.vue'
+import { t } from '../i18n/index.js'
 
 const { entries, refresh, remove } = useVideoHistory()
 
@@ -23,29 +24,32 @@ function formatDuration(seconds) {
   <aside class="rounded-2xl border border-ink-200 bg-white p-5 shadow-card">
     <div class="flex items-center gap-2">
       <AppIcon name="history" class="h-4 w-4 text-ink-500" />
-      <h3 class="text-sm font-semibold text-ink-900">Vidéos déjà sous-titrées</h3>
+      <h3 class="text-sm font-semibold text-ink-900">{{ t('history.title') }}</h3>
     </div>
     <p class="mt-1 text-xs leading-relaxed text-ink-500">
-      Redéposez l'une de ces vidéos : ses sous-titres sont restaurés instantanément.
+      {{ t('history.hint') }}
     </p>
 
     <p v-if="!entries.length" class="mt-6 rounded-xl bg-ink-50 px-3 py-6 text-center text-xs text-ink-500">
-      Aucune pour l'instant.
+      {{ t('history.empty') }}
     </p>
 
     <ul class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <li v-for="entry in entries" :key="entry.fingerprint" class="overflow-hidden rounded-xl border border-ink-200">
         <img v-if="entry.thumbnailDataUrl" :src="entry.thumbnailDataUrl" alt="" class="aspect-video w-full bg-ink-100 object-cover" />
+        <div v-else class="flex aspect-video w-full items-center justify-center bg-ink-100 text-ink-400">
+          <AppIcon name="film" class="h-6 w-6" />
+        </div>
         <div class="flex flex-col gap-1 p-3">
           <p class="truncate text-sm font-medium text-ink-900" :title="entry.fileName">{{ entry.fileName }}</p>
           <span v-if="entry.language" class="w-fit rounded-full bg-ink-100 px-2 py-0.5 text-xs text-ink-700">
-            {{ entry.language === 'fr' ? 'Français' : entry.language === 'mixed' ? 'Français puis English' : 'English' }}
+            {{ t('lang.' + entry.language) }}
           </span>
           <div class="flex items-center justify-between text-xs text-ink-500">
             <span class="tabular-nums">{{ formatDuration(entry.durationSeconds) }}</span>
             <button class="flex items-center gap-1 hover:text-red-600" @click="remove(entry.fingerprint)">
               <AppIcon name="trash" class="h-3.5 w-3.5" />
-              Supprimer
+              {{ t('history.delete') }}
             </button>
           </div>
         </div>

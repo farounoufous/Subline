@@ -11,7 +11,9 @@ import { createInferencePool } from '../workers/worker-pool.js'
 import { formatClause, applyReadingTiming } from '../utils/subtitle-format.js'
 import { cleanSubtitles } from '../utils/hallucination-filter.js'
 import { runOnlinePipeline } from '../online/online-pipeline.js'
+import { runEmbeddedPipeline } from '../online/embedded-pipeline.js'
 import { OnlineError } from '../online/groq-client.js'
+import { t } from '../i18n/index.js'
 import {
   getPartialProgress,
   savePartialProgress,
@@ -42,7 +44,7 @@ export function useSubtitleGeneration() {
   const etaSeconds = ref(null)
   // Progression d'un traitement interrompu retrouvé : { percent } | null
   const partialInfo = ref(null)
-  // Moteur de la dernière génération : 'local' | 'online'
+  // Moteur de la dernière génération : 'local' | 'online' | 'embedded'
   const engine = ref('local')
   // Nature de l'erreur en ligne : 'auth' | 'quota' | 'network' | 'invalid' | 'other' | null
   const errorKind = ref(null)
@@ -312,19 +314,35 @@ export function useSubtitleGeneration() {
       if (runToken !== runId) return null
       maybeSavePartial(true)
       status.value = 'error'
-      errorMessage.value = (fatalError || error).message
+      errorMessage.value = describeFatal(fatalError || error)
       throw fatalError || error
     }
   }
 
+  // Erreur locale : le worker envoie un code ('modelLoad') et le détail brut.
+  function describeFatal(error) {
+    if (error.code === 'modelLoad') return t('err.modelLoad', { detail: error.message })
+    if (error instanceof OnlineError) return error.message
+    return t('err.generation', { detail: error.message })
+  }
+
+  // Mode de sauvegarde partielle d'une génération en ligne ou intégrée.
+  function onlinePartialMode(source, targetLanguage, trackIndex) {
+    return source === 'embedded' ? `embedded-${trackIndex}-${targetLanguage}` : `online-${targetLanguage}`
+  }
+
   function describeOnlineError(error) {
-    if (!(error instanceof OnlineError)) return `Échec du traitement en ligne : ${error.message}`
+    if (!(error instanceof OnlineError)) return t('err.generic', { detail: error.message })
     if (error.kind === 'quota') {
       const wait = error.retryAfterSeconds
-      const hint = wait ? ` Réessayez dans ${wait >= 90 ? `${Math.ceil(wait / 60)} min` : `${wait} s`}.` : ' Réessayez plus tard.'
-      return `Le quota gratuit du service en ligne est atteint.${hint} La progression est conservée.`
+      const hint = wait
+        ? wait >= 90
+          ? t('err.quotaWaitMinutes', { value: Math.ceil(wait / 60) })
+          : t('err.quotaWaitSeconds', { value: wait })
+        : t('err.quotaLater')
+      return t('err.quotaBase') + hint + t('err.quotaKept')
     }
-    if (error.kind === 'network') return `${error.message} La progression est conservée.`
+    if (error.kind === 'network') return t('err.networkKept')
     return error.message
   }
 
@@ -333,14 +351,14 @@ export function useSubtitleGeneration() {
    * Groq. Reprend automatiquement à la fin de la dernière fenêtre déjà
    * traitée si une progression existe pour cette vidéo et cette langue.
    */
-  async function startOnline(file, { fingerprint, apiKey, targetLanguage, durationHint }) {
+  async function startOnline(file, { fingerprint, apiKey, targetLanguage, durationHint, source = 'online', trackIndex = 0, trackLanguage = null }) {
     cancel()
     resetRunState()
     const runToken = ++runId
     abortController = new AbortController()
     const signal = abortController.signal
-    storageKey = partialKey(fingerprint, `online-${targetLanguage}`)
-    engine.value = 'online'
+    storageKey = partialKey(fingerprint, onlinePartialMode(source, targetLanguage, trackIndex))
+    engine.value = source
     outputLanguage.value = targetLanguage
     status.value = 'processing'
     partialInfo.value = null
@@ -373,10 +391,13 @@ export function useSubtitleGeneration() {
     readyAtGenerationStart = readyUpToTime.value
 
     try {
-      await runOnlinePipeline(file, {
+      const pipeline = source === 'embedded'
+        ? (options) => runEmbeddedPipeline(file, { ...options, trackIndex, trackLanguage })
+        : (options) => runOnlinePipeline(file, { ...options, durationHint })
+
+      await pipeline({
         apiKey,
         targetLanguage,
-        durationHint,
         signal,
         startAt,
         onWindow: (window) => {

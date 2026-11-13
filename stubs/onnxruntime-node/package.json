@@ -1,0 +1,7 @@
+{
+  "name": "onnxruntime-node",
+  "version": "1.21.0",
+  "description": "Stub vide : Subline s'exécute dans le navigateur (onnxruntime-web), le runtime Node de transformers.js est inutile et pèse plus de 500 Mo.",
+  "main": "index.js",
+  "license": "MIT"
+}

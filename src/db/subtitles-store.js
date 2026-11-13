@@ -7,11 +7,15 @@
 // que d'afficher des sous-titres produits par une logique périmée.
 
 const DB_NAME = 'sous-titrage-local'
-const DB_VERSION = 2
+const DB_VERSION = 3
 const STORE_NAME = 'processedVideos'
 // Progression d'un traitement interrompu, segment par segment, pour
 // pouvoir le reprendre sans tout recalculer.
 const PARTIALS_STORE_NAME = 'partialProgress'
+// File d'attente : métadonnées des fichiers et, quand le navigateur le
+// permet (Chrome, Edge), leur FileSystemFileHandle pour les rouvrir après
+// un rechargement sans que l'utilisateur ait à les rechoisir.
+const QUEUE_STORE_NAME = 'queueItems'
 const CACHE_FORMAT_VERSION = 6
 
 function openDatabase() {
@@ -25,6 +29,9 @@ function openDatabase() {
       }
       if (!db.objectStoreNames.contains(PARTIALS_STORE_NAME)) {
         db.createObjectStore(PARTIALS_STORE_NAME, { keyPath: 'key' })
+      }
+      if (!db.objectStoreNames.contains(QUEUE_STORE_NAME)) {
+        db.createObjectStore(QUEUE_STORE_NAME, { keyPath: 'id' })
       }
     }
     request.onsuccess = () => resolve(request.result)
@@ -103,3 +110,12 @@ export async function savePartialProgress(key, segments) {
 export async function deletePartialProgress(key) {
   await withStore('readwrite', (store) => store.delete(key), PARTIALS_STORE_NAME)
 }
+
+// --- File d'attente ---
+
+export const getAllQueueItems = () =>
+  withStore('readonly', (store) => store.getAll(), QUEUE_STORE_NAME).then((rows) => rows || [])
+
+export const saveQueueItem = (item) => withStore('readwrite', (store) => store.put(item), QUEUE_STORE_NAME)
+
+export const deleteQueueItem = (id) => withStore('readwrite', (store) => store.delete(id), QUEUE_STORE_NAME)

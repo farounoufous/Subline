@@ -1,19 +1,27 @@
 <script setup>
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
-import { computeFingerprint } from '../utils/fingerprint.js'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { captureThumbnail } from '../utils/thumbnail.js'
 import { toSrt, toVtt, downloadTextFile } from '../utils/subtitle-export.js'
+import { mediaKind, PICKER_TYPES, FILE_INPUT_ACCEPT } from '../utils/media-file.js'
 import { getProcessedVideo, saveProcessedVideo, subtitleCacheKey } from '../db/subtitles-store.js'
 import { useVideoHistory } from '../db/useVideoHistory.js'
+import { useQueue } from '../db/useQueue.js'
 import { useSubtitleGeneration } from '../composables/useSubtitleGeneration.js'
+import { probeSubtitleTracks } from '../audio/embedded-subtitles.js'
+import { t } from '../i18n/index.js'
 import AppIcon from './ui/AppIcon.vue'
 import TranscriptPanel from './TranscriptPanel.vue'
 import GenerationPanel from './GenerationPanel.vue'
+import QueuePanel from './QueuePanel.vue'
 
-const LANGUAGE_LABELS = { en: 'English', fr: 'Français', mixed: 'Français puis English' }
 const CACHED_LANGUAGES = ['en', 'fr', 'mixed']
+const POSITION_KEY_PREFIX = 'subline:position:'
+const POSITION_SAVE_INTERVAL_MS = 2000
+// Erreurs qui rendraient inutile de continuer la file avec les fichiers suivants.
+const QUEUE_STOPPING_ERRORS = ['quota', 'auth', 'network']
 
 const { refresh: refreshHistory } = useVideoHistory()
+const queue = useQueue()
 const generation = useSubtitleGeneration()
 const {
   status,
@@ -36,13 +44,18 @@ const {
 
 const playerContainerRef = ref(null)
 const videoRef = ref(null)
+const fileInputRef = ref(null)
 const videoSrc = ref(null)
 const fileName = ref('')
+const currentKind = ref('video')
+const currentFile = ref(null)
 const isDraggingOver = ref(false)
 const isFullscreen = ref(false)
 const restoredFromCache = ref(false)
 const showCatchUpPrompt = ref(false)
-// Durée de la vidéo, réactive (l'élément <video> ne l'est pas).
+const dropNotice = ref('')
+const queueRunning = ref(false)
+// Durée du média, réactive (l'élément <video> ne l'est pas).
 const videoDuration = ref(0)
 
 const activeIndex = ref(-1)
@@ -56,9 +69,19 @@ let currentPartialMode = 'english'
 let lastOptions = null
 
 let objectUrl = null
-let currentFile = null
 let currentFingerprint = null
 let bypassCatchUpCheck = false
+let stopRequested = false
+let metadataWaiter = null
+let lastPositionSave = 0
+
+const isAudio = computed(() => currentKind.value === 'audio')
+// Élément de la file affiché mais dont le fichier n'est pas (encore) ouvert.
+const pendingRestore = computed(() => {
+  if (videoSrc.value || !queue.currentId.value) return null
+  return queue.items.value.find((item) => item.id === queue.currentId.value) || null
+})
+const queueToProcess = computed(() => queue.items.value.filter((item) => item.status !== 'done' && queue.hasFile(item.id)).length)
 
 // --- Lecture et sous-titre actif ---
 
@@ -79,14 +102,37 @@ function updateActiveSubtitle() {
   activeSubtitleText.value = index >= 0 ? subtitles.value[index].text : ''
 }
 
+function savePosition() {
+  const id = queue.currentId.value
+  if (!id || !videoRef.value) return
+  try {
+    localStorage.setItem(POSITION_KEY_PREFIX + id, String(Math.floor(videoRef.value.currentTime)))
+  } catch {
+    // Sans conséquence.
+  }
+}
+
+function readPosition(id) {
+  try {
+    return Number(localStorage.getItem(POSITION_KEY_PREFIX + id)) || 0
+  } catch {
+    return 0
+  }
+}
+
 function onTimeUpdate() {
   if (!videoRef.value) return
   updateActiveSubtitle()
 
+  if (Date.now() - lastPositionSave > POSITION_SAVE_INTERVAL_MS) {
+    lastPositionSave = Date.now()
+    savePosition()
+  }
+
   const pastReadyPoint = videoRef.value.currentTime > readyUpToTime.value + 0.5
   const notFullyDone = readyUpToTime.value < totalDuration.value
 
-  if (status.value === 'processing' && !bypassCatchUpCheck && pastReadyPoint && notFullyDone) {
+  if (status.value === 'processing' && !queueRunning.value && !bypassCatchUpCheck && pastReadyPoint && notFullyDone) {
     videoRef.value.pause()
     showCatchUpPrompt.value = true
   }
@@ -152,7 +198,7 @@ function exportSubtitles(format) {
 // --- Cache et génération ---
 
 async function checkCache(fingerprint) {
-  // Plusieurs langues peuvent exister pour une même vidéo : on restaure
+  // Plusieurs langues peuvent exister pour un même fichier : on restaure
   // la plus récente.
   const candidates = await Promise.all(
     CACHED_LANGUAGES.map((language) => getProcessedVideo(subtitleCacheKey(fingerprint, language)))
@@ -162,19 +208,15 @@ async function checkCache(fingerprint) {
 
   generation.restoreFromCache(cached)
   restoredFromCache.value = true
-
-  try {
-    await videoRef.value?.play()
-  } catch (error) {
-    console.warn('Lecture automatique refusée par le navigateur :', error.message)
-  }
+  // Un fichier restauré après rechargement ne démarre pas tout seul :
+  // la lecture reprend à la position mémorisée, sur demande.
 }
 
 async function persistResult(fingerprint, file) {
   if (fingerprint !== currentFingerprint) return
 
   const language = outputLanguage.value
-  const thumbnailDataUrl = await captureThumbnail(objectUrl)
+  const thumbnailDataUrl = isAudio.value ? null : await captureThumbnail(objectUrl)
   await saveProcessedVideo({
     fingerprint: subtitleCacheKey(fingerprint, language),
     fileName: file.name,
@@ -200,7 +242,25 @@ function onSelectionChange({ partialMode }) {
 
 function onLoadedMetadata() {
   videoDuration.value = videoRef.value?.duration || 0
+  const saved = readPosition(queue.currentId.value)
+  if (saved > 1 && saved < videoDuration.value - 2 && videoRef.value) videoRef.value.currentTime = saved
   refreshPartialInfo()
+  metadataWaiter?.()
+}
+
+// Attend que la durée du média soit connue (indispensable avant de lancer
+// un traitement), sans bloquer si le navigateur ne sait pas lire le fichier.
+function waitForMetadata() {
+  if (videoDuration.value > 0) return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, 15000)
+    function done() {
+      clearTimeout(timer)
+      metadataWaiter = null
+      resolve()
+    }
+    metadataWaiter = done
+  })
 }
 
 function prepareRun() {
@@ -209,20 +269,29 @@ function prepareRun() {
   bypassCatchUpCheck = false
 }
 
-// Lance une génération et sauvegarde le résultat en cas de succès.
+/**
+ * Lance une génération pour le fichier courant et sauvegarde le résultat.
+ * Résout avec true (réussie), false (échec) ou null (annulée).
+ */
 async function runGeneration(task) {
-  if (!currentFile || status.value === 'processing') return
+  if (!currentFile.value || status.value === 'processing') return false
   prepareRun()
 
   const fingerprint = currentFingerprint
-  const file = currentFile
+  const file = currentFile.value
+  const id = queue.currentId.value
+  if (id) queue.setStatus(id, 'processing')
 
   try {
     const result = await task({ fingerprint, file, durationHint: videoRef.value?.duration })
-    if (result === null) return // annulée (autre vidéo chargée)
+    if (result === null) {
+      if (id) queue.setStatus(id, 'pending')
+      return null // annulée (autre fichier chargé)
+    }
   } catch (error) {
     console.error('Échec de la génération :', error)
-    return
+    if (id) queue.setStatus(id, 'error', errorMessage.value || error.message)
+    return false
   }
 
   try {
@@ -230,17 +299,45 @@ async function runGeneration(task) {
   } catch (error) {
     console.warn('Sauvegarde du résultat dans IndexedDB impossible :', error.message)
   }
+  if (id) queue.setStatus(id, 'done')
+  return true
+}
+
+// Choisit la première piste texte d'un fichier (utilisé par la file, où
+// l'utilisateur ne choisit pas fichier par fichier).
+async function resolveEmbeddedTrack(file) {
+  const tracks = await probeSubtitleTracks(file)
+  const track = tracks.find((candidate) => candidate.readable)
+  if (!track) throw new Error(tracks.length ? t('embedded.onlyImage') : t('embedded.none'))
+  return track
 }
 
 function generateSubtitles(options) {
   lastOptions = options
-  return runGeneration(({ fingerprint, file, durationHint }) => {
+  return runGeneration(async ({ fingerprint, file, durationHint }) => {
     if (options.engine === 'online') {
       return generation.startOnline(file, {
         fingerprint,
         apiKey: options.apiKey,
         targetLanguage: options.targetLanguage,
         durationHint
+      })
+    }
+    if (options.engine === 'embedded') {
+      let { trackIndex, trackLanguage } = options
+      if (trackIndex === null || trackIndex === undefined) {
+        const track = await resolveEmbeddedTrack(file)
+        trackIndex = track.index
+        trackLanguage = track.language
+      }
+      return generation.startOnline(file, {
+        fingerprint,
+        apiKey: options.apiKey,
+        targetLanguage: options.targetLanguage,
+        durationHint,
+        source: 'embedded',
+        trackIndex,
+        trackLanguage
       })
     }
     return generation.start(file, { fingerprint, mode: options.sourceMode, durationHint })
@@ -269,18 +366,17 @@ function backToSettings() {
   refreshPartialInfo()
 }
 
-function loadFile(file) {
-  if (!file || !file.type.startsWith('video/')) {
-    console.warn("Fichier ignoré : ce n'est pas une vidéo.", file?.type)
-    return
-  }
+// --- Chargement d'un fichier ---
 
+function loadFile(file, id) {
   generation.reset()
   if (objectUrl) URL.revokeObjectURL(objectUrl)
 
   objectUrl = URL.createObjectURL(file)
-  currentFile = file
-  currentFingerprint = computeFingerprint(file)
+  currentFile.value = file
+  currentKind.value = mediaKind(file) || 'video'
+  currentFingerprint = id
+  queue.setCurrent(id)
   videoSrc.value = objectUrl
   fileName.value = file.name
   activeIndex.value = -1
@@ -290,33 +386,199 @@ function loadFile(file) {
   bypassCatchUpCheck = false
   subtitleOffset.value = 0
   videoDuration.value = 0
+  dropNotice.value = ''
 
   checkCache(currentFingerprint)
 }
 
+// Ouvre un élément de la file : charge son fichier s'il est disponible,
+// sinon l'affiche comme "à rouvrir".
+function selectItem(id) {
+  if (queueRunning.value) return
+  openItem(id)
+}
+
+function openItem(id) {
+  const file = queue.fileFor(id)
+  if (file) {
+    loadFile(file, id)
+    return true
+  }
+  generation.cancel()
+  generation.reset()
+  if (objectUrl) URL.revokeObjectURL(objectUrl)
+  objectUrl = null
+  videoSrc.value = null
+  currentFile.value = null
+  currentFingerprint = null
+  queue.setCurrent(id)
+  return false
+}
+
+async function reopenItem(id) {
+  const file = await queue.reopen(id)
+  if (file) {
+    if (!videoSrc.value || queue.currentId.value === id || !queueRunning.value) openItem(id)
+    return
+  }
+  // Pas de handle (ou permission refusée) : on demande de rechoisir le fichier.
+  await pickFiles()
+}
+
+/** Ajoute des fichiers à la file ; le premier ouvre le lecteur s'il est vide. */
+function addFiles(entries, { open = true } = {}) {
+  let firstAdded = null
+  let rejected = 0
+  for (const { file, handle } of entries) {
+    const item = queue.add(file, handle)
+    if (!item) {
+      rejected++
+      continue
+    }
+    if (!firstAdded) firstAdded = item
+  }
+  dropNotice.value = rejected ? t('drop.ignored') : ''
+  if (firstAdded && !queueRunning.value && (open || !videoSrc.value || queue.currentId.value === firstAdded.id)) {
+    openItem(firstAdded.id)
+  }
+}
+
+// Ouvrir le premier fichier choisi, ou seulement l'ajouter à la file ?
+let openAfterPick = true
+
+async function pickFiles(open = true) {
+  openAfterPick = open
+  if (typeof window.showOpenFilePicker === 'function') {
+    try {
+      const handles = await window.showOpenFilePicker({ multiple: true, types: PICKER_TYPES })
+      const entries = await Promise.all(handles.map(async (handle) => ({ file: await handle.getFile(), handle })))
+      addFiles(entries, { open })
+    } catch (error) {
+      // AbortError : l'utilisateur a fermé la fenêtre.
+      if (error.name !== 'AbortError') console.warn('Sélection de fichiers impossible :', error.message)
+    }
+    return
+  }
+  fileInputRef.value?.click()
+}
+
 function onFileInputChange(event) {
-  loadFile(event.target.files[0])
+  addFiles([...event.target.files].map((file) => ({ file, handle: null })), { open: openAfterPick })
+  openAfterPick = true
   event.target.value = ''
 }
 
 function onDrop(event) {
   event.preventDefault()
   isDraggingOver.value = false
-  loadFile(event.dataTransfer.files[0])
+
+  // Les handles doivent être demandés pendant l'évènement : la liste
+  // d'éléments déposés n'est plus valide après le premier await.
+  const dropped = [...event.dataTransfer.items]
+    .filter((item) => item.kind === 'file')
+    .map((item) => ({
+      file: item.getAsFile(),
+      handlePromise: typeof item.getAsFileSystemHandle === 'function' ? item.getAsFileSystemHandle().catch(() => null) : Promise.resolve(null)
+    }))
+
+  Promise.all(
+    dropped.map(async ({ file, handlePromise }) => {
+      const handle = await handlePromise
+      return { file, handle: handle?.kind === 'file' ? handle : null }
+    })
+  ).then((entries) => addFiles(entries, { open: !videoSrc.value }))
+}
+
+// --- File d'attente ---
+
+function outputLanguageFor(options) {
+  return options.engine === 'local' ? 'en' : options.targetLanguage
+}
+
+async function runQueue(options) {
+  if (queueRunning.value) return
+  lastOptions = options
+  queueRunning.value = true
+  stopRequested = false
+
+  // Le fichier courant d'abord, puis le reste dans l'ordre d'ajout.
+  const currentFirst = [...queue.items.value].sort((a, b) => (b.id === queue.currentId.value) - (a.id === queue.currentId.value))
+  const ids = currentFirst
+    .filter((item) => item.status !== 'done' && queue.hasFile(item.id))
+    .map((item) => item.id)
+
+  try {
+    for (const id of ids) {
+      if (stopRequested) break
+
+      if (id !== queue.currentId.value || !videoSrc.value) {
+        openItem(id)
+        await waitForMetadata()
+      }
+
+      // Déjà sous-titré dans la langue demandée : rien à refaire.
+      const cached = await getProcessedVideo(subtitleCacheKey(id, outputLanguageFor(options))).catch(() => null)
+      if (cached) {
+        queue.setStatus(id, 'done')
+        continue
+      }
+
+      const result = await generateSubtitles(options)
+      if (result === null) break
+      if (result === false && QUEUE_STOPPING_ERRORS.includes(errorKind.value)) break
+    }
+  } finally {
+    queueRunning.value = false
+  }
+}
+
+function stopQueue() {
+  stopRequested = true
+  generation.cancel()
+  generation.reset()
+}
+
+function onGenerate(options) {
+  if (options.all) return runQueue(options)
+  return generateSubtitles(options)
+}
+
+function removeItem(id) {
+  if (id === queue.currentId.value) {
+    generation.cancel()
+    generation.reset()
+    if (objectUrl) URL.revokeObjectURL(objectUrl)
+    objectUrl = null
+    videoSrc.value = null
+    currentFile.value = null
+    currentFingerprint = null
+  }
+  queue.remove(id)
 }
 
 function formatEta(seconds) {
   if (seconds === null || seconds === undefined) return ''
-  if (seconds < 60) return "moins d'une minute"
-  return `environ ${Math.round(seconds / 60)} min`
+  if (seconds < 60) return t('phase.etaLess')
+  return t('phase.etaMinutes', { minutes: Math.round(seconds / 60) })
 }
 
-onMounted(() => {
+onMounted(async () => {
   document.addEventListener('fullscreenchange', onFullscreenChange)
+  window.addEventListener('pagehide', savePosition)
+  await queue.load()
+  // Reprise de la session précédente : le fichier s'ouvre seul quand le
+  // navigateur a conservé l'autorisation, sinon un bouton propose de le rouvrir.
+  if (queue.currentId.value && queue.items.value.some((item) => item.id === queue.currentId.value)) {
+    openItem(queue.currentId.value)
+  } else if (queue.currentId.value) {
+    queue.setCurrent(null)
+  }
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', onFullscreenChange)
+  window.removeEventListener('pagehide', savePosition)
+  savePosition()
   generation.cancel()
   if (objectUrl) URL.revokeObjectURL(objectUrl)
 })
@@ -324,175 +586,206 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="grid gap-6" :class="videoSrc ? 'lg:grid-cols-[minmax(0,1fr)_22rem]' : ''">
-    <div
-      class="self-start overflow-hidden rounded-2xl border bg-white shadow-card transition-colors"
-      :class="isDraggingOver ? 'border-brand-500' : 'border-ink-200'"
-      @dragover.prevent="isDraggingOver = true"
-      @dragleave.prevent="isDraggingOver = false"
-      @drop="onDrop"
-    >
-      <!-- Zone de dépôt -->
+    <div class="flex min-w-0 flex-col gap-6">
       <div
-        v-if="!videoSrc"
-        class="flex flex-col items-center justify-center gap-4 px-6 py-20 text-center transition-colors"
-        :class="isDraggingOver ? 'bg-brand-50' : 'bg-white'"
+        class="self-stretch overflow-hidden rounded-2xl border bg-white shadow-card transition-colors"
+        :class="isDraggingOver ? 'border-brand-500' : 'border-ink-200'"
+        @dragover.prevent="isDraggingOver = true"
+        @dragleave.prevent="isDraggingOver = false"
+        @drop="onDrop"
       >
-        <span class="flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-50 text-brand-600">
-          <AppIcon name="film" class="h-7 w-7" />
-        </span>
-        <div>
-          <p class="text-lg font-semibold text-ink-900">Glissez une vidéo ici</p>
-          <p class="mt-1 text-sm text-ink-500">MP4, MKV, WebM... Le fichier reste sur votre appareil.</p>
+        <!-- Zone de dépôt -->
+        <div
+          v-if="!videoSrc"
+          class="flex flex-col items-center justify-center gap-4 px-6 py-20 text-center transition-colors"
+          :class="isDraggingOver ? 'bg-brand-50' : 'bg-white'"
+        >
+          <span class="flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-50 text-brand-600">
+            <AppIcon name="film" class="h-7 w-7" />
+          </span>
+
+          <template v-if="pendingRestore">
+            <div>
+              <p class="text-lg font-semibold text-ink-900">{{ pendingRestore.name }}</p>
+              <p class="mx-auto mt-1 max-w-md text-sm text-ink-500">{{ t('drop.reopenHint') }}</p>
+            </div>
+            <button class="btn-primary" data-testid="reopen" @click="reopenItem(pendingRestore.id)">
+              {{ t('drop.reopen', { name: pendingRestore.name }) }}
+            </button>
+            <button class="text-sm text-brand-600 hover:text-brand-700" @click="pickFiles()">{{ t('drop.choose') }}</button>
+          </template>
+
+          <template v-else>
+            <div>
+              <p class="text-lg font-semibold text-ink-900">{{ t('drop.title') }}</p>
+              <p class="mt-1 text-sm text-ink-500">{{ t('drop.hint') }}</p>
+            </div>
+            <button class="btn-primary" @click="pickFiles()">{{ t('drop.choose') }}</button>
+          </template>
+          <p v-if="dropNotice" class="text-sm text-red-600">{{ dropNotice }}</p>
         </div>
-        <label class="btn-primary cursor-pointer">
-          Choisir un fichier
-          <input type="file" accept="video/*" class="hidden" @change="onFileInputChange" />
-        </label>
+
+        <!-- Lecteur -->
+        <template v-else>
+          <div ref="playerContainerRef" class="group relative bg-black">
+            <video
+              ref="videoRef"
+              :src="videoSrc"
+              controls
+              controlsList="nofullscreen"
+              class="block w-full bg-black"
+              :class="isAudio ? 'h-56' : isFullscreen ? 'h-screen object-contain' : 'max-h-[70vh]'"
+              @timeupdate="onTimeUpdate"
+              @seeked="savePosition"
+              @pause="savePosition"
+              @loadedmetadata="onLoadedMetadata"
+              @click="toggleVideoPlayback"
+            ></video>
+
+            <div v-if="isAudio" class="pointer-events-none absolute inset-x-0 top-0 flex h-40 flex-col items-center justify-center gap-2 text-white/70">
+              <AppIcon name="play" class="h-8 w-8" />
+              <span class="text-xs">{{ t('player.audioOnly') }}</span>
+            </div>
+
+            <div
+              v-if="(status === 'ready' || playbackUnlocked) && activeSubtitleText"
+              class="pointer-events-none absolute inset-x-0 flex justify-center px-6"
+              :class="isAudio ? 'bottom-16' : 'bottom-[12%]'"
+            >
+              <p class="subtitle-overlay whitespace-pre-line bg-black px-3 py-1.5 text-center font-medium text-white">
+                {{ activeSubtitleText }}
+              </p>
+            </div>
+
+            <button
+              v-if="!isAudio"
+              class="absolute right-3 top-3 flex h-9 w-9 items-center justify-center rounded-lg bg-black/50 text-white opacity-0 transition-opacity focus:opacity-100 group-hover:opacity-100"
+              :aria-label="isFullscreen ? t('player.exitFullscreen') : t('player.fullscreen')"
+              @click="toggleFullscreen"
+            >
+              <AppIcon :name="isFullscreen ? 'exitFullscreen' : 'fullscreen'" class="h-5 w-5" />
+            </button>
+
+            <div v-if="showCatchUpPrompt" class="absolute inset-0 flex items-center justify-center bg-black/70 p-6">
+              <div class="flex max-w-sm flex-col gap-4 rounded-2xl bg-white p-6 text-center shadow-card">
+                <p class="text-sm text-ink-700">{{ t('catchup.text') }}</p>
+                <div class="flex justify-center gap-2">
+                  <button class="btn-secondary" @click="keepWaiting">{{ t('catchup.wait') }}</button>
+                  <button class="btn-primary" @click="continueWithoutSubtitles">{{ t('catchup.continue') }}</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Barre d'état sous le lecteur -->
+          <div class="flex flex-col gap-4 p-5">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p class="truncate text-sm font-medium text-ink-900" :title="fileName">{{ fileName }}</p>
+              <button class="text-sm text-brand-600 hover:text-brand-700" @click="pickFiles()">{{ t('player.changeFile') }}</button>
+            </div>
+
+            <!-- Prêt à générer -->
+            <GenerationPanel
+              v-if="status === 'idle' && !queueRunning"
+              :partial-info="partialInfo"
+              :duration-seconds="videoDuration"
+              :file="currentFile"
+              :kind="currentKind"
+              :queue-count="queueToProcess"
+              @selection="onSelectionChange"
+              @generate="onGenerate"
+            />
+
+            <!-- Traitement en cours -->
+            <div v-if="status === 'processing'" class="flex flex-col gap-3">
+              <div v-if="playbackUnlocked" class="flex items-center gap-2 rounded-xl bg-brand-50 px-4 py-3 text-sm text-brand-900">
+                <AppIcon name="check" class="h-5 w-5 flex-shrink-0 text-brand-600" />
+                <span>{{ t('phase.unlocked') }}</span>
+              </div>
+
+              <div class="flex flex-col gap-1.5">
+                <p class="text-sm text-ink-700">
+                  <template v-if="processingPhase === 'decoding'">{{ engine === 'local' ? t('phase.decodingLocal') : t('phase.decoding') }}</template>
+                  <template v-else-if="processingPhase === 'loading'">{{ t('phase.loading') }}</template>
+                  <template v-else-if="processingPhase === 'downloading'">
+                    {{ t('phase.downloading') }}
+                    <span class="text-ink-500">({{ Math.round(modelDownloadProgress) }} %)</span>
+                  </template>
+                  <template v-else>
+                    {{ engine === 'online' ? t('phase.generatingOnline') : engine === 'embedded' ? t('phase.translatingEmbedded') : t('phase.generatingLocal') }}
+                    <span class="text-ink-500">
+                      ({{ progressPercent }} %<template v-if="etaSeconds !== null"> &middot; {{ t('phase.eta', { time: formatEta(etaSeconds) }) }}</template>)
+                    </span>
+                  </template>
+                </p>
+
+                <div class="h-2 w-full overflow-hidden rounded-full bg-ink-100">
+                  <div
+                    v-if="processingPhase === 'decoding' || processingPhase === 'loading'"
+                    class="indeterminate-bar h-full w-1/3 rounded-full bg-brand-600"
+                  ></div>
+                  <div
+                    v-else
+                    class="h-full rounded-full bg-brand-600 transition-[width] duration-300"
+                    :style="{ width: (processingPhase === 'downloading' ? Math.round(modelDownloadProgress) : progressPercent) + '%' }"
+                  ></div>
+                </div>
+
+                <p v-if="processingPhase === 'downloading'" class="text-xs text-ink-500">{{ t('phase.downloadingHint') }}</p>
+                <p v-if="processingPhase === 'generating' && silenceSkippedSeconds > 1" class="text-xs text-ink-500">
+                  {{ t('phase.silence', { seconds: Math.round(silenceSkippedSeconds) }) }}
+                </p>
+              </div>
+            </div>
+
+            <!-- Terminé -->
+            <div v-if="status === 'ready'" class="flex flex-wrap items-center justify-between gap-3">
+              <p class="flex items-center gap-2 text-sm text-ink-600">
+                <AppIcon name="check" class="h-4 w-4 text-brand-600" />
+                {{ !subtitles.length ? t('ready.none') : restoredFromCache ? t('ready.restored') : t('ready.done') }}
+                <span v-if="subtitles.length" class="rounded-full bg-ink-100 px-2 py-0.5 text-xs text-ink-700">
+                  {{ t('lang.' + outputLanguage) }}
+                </span>
+              </p>
+              <div v-if="subtitles.length" class="flex gap-2">
+                <button class="btn-secondary !px-3 !py-1.5" @click="exportSubtitles('srt')">
+                  <AppIcon name="download" class="h-4 w-4" /> {{ t('export.srt') }}
+                </button>
+                <button class="btn-secondary !px-3 !py-1.5" @click="exportSubtitles('vtt')">
+                  <AppIcon name="download" class="h-4 w-4" /> {{ t('export.vtt') }}
+                </button>
+              </div>
+            </div>
+
+            <div v-if="status === 'error'" class="flex flex-col gap-3 rounded-xl bg-red-50 px-4 py-3">
+              <p class="text-sm text-red-700">{{ errorMessage }}</p>
+              <div class="flex flex-wrap gap-2">
+                <button v-if="errorKind === 'auth'" class="btn-secondary !px-3 !py-1.5" @click="backToSettings">{{ t('error.changeKey') }}</button>
+                <button v-else-if="engine !== 'local'" class="btn-secondary !px-3 !py-1.5" @click="retryGeneration">{{ t('error.retry') }}</button>
+                <button v-if="canContinueLocally" class="btn-primary !px-3 !py-1.5" @click="continueInLocal">
+                  {{ t('error.finishLocal') }}
+                </button>
+                <button v-if="engine === 'local' || engine === 'embedded' || errorKind === 'auth'" class="btn-secondary !px-3 !py-1.5" @click="backToSettings">{{ t('error.backToSettings') }}</button>
+              </div>
+              <p v-if="canContinueLocally" class="text-xs text-red-700/80">{{ t('error.finishLocalHint') }}</p>
+            </div>
+          </div>
+        </template>
       </div>
 
-      <!-- Lecteur -->
-      <template v-else>
-        <div ref="playerContainerRef" class="group relative bg-black">
-          <video
-            ref="videoRef"
-            :src="videoSrc"
-            controls
-            controlsList="nofullscreen"
-            class="block w-full bg-black"
-            :class="isFullscreen ? 'h-screen object-contain' : 'max-h-[70vh]'"
-            @timeupdate="onTimeUpdate"
-            @loadedmetadata="onLoadedMetadata"
-            @click="toggleVideoPlayback"
-          ></video>
-
-          <div
-            v-if="(status === 'ready' || playbackUnlocked) && activeSubtitleText"
-            class="pointer-events-none absolute inset-x-0 bottom-[12%] flex justify-center px-6"
-          >
-            <p class="subtitle-overlay whitespace-pre-line bg-black px-3 py-1.5 text-center font-medium text-white">
-              {{ activeSubtitleText }}
-            </p>
-          </div>
-
-          <button
-            class="absolute right-3 top-3 flex h-9 w-9 items-center justify-center rounded-lg bg-black/50 text-white opacity-0 transition-opacity focus:opacity-100 group-hover:opacity-100"
-            :aria-label="isFullscreen ? 'Quitter le plein écran' : 'Plein écran'"
-            @click="toggleFullscreen"
-          >
-            <AppIcon :name="isFullscreen ? 'exitFullscreen' : 'fullscreen'" class="h-5 w-5" />
-          </button>
-
-          <div v-if="showCatchUpPrompt" class="absolute inset-0 flex items-center justify-center bg-black/70 p-6">
-            <div class="flex max-w-sm flex-col gap-4 rounded-2xl bg-white p-6 text-center shadow-card">
-              <p class="text-sm text-ink-700">
-                La suite n'est pas encore sous-titrée (génération en cours). Continuer la lecture sans sous-titres pour l'instant ?
-              </p>
-              <div class="flex justify-center gap-2">
-                <button class="btn-secondary" @click="keepWaiting">Attendre</button>
-                <button class="btn-primary" @click="continueWithoutSubtitles">Continuer sans sous-titres</button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Barre d'état sous le lecteur -->
-        <div class="flex flex-col gap-4 p-5">
-          <div class="flex flex-wrap items-center justify-between gap-3">
-            <p class="truncate text-sm font-medium text-ink-900" :title="fileName">{{ fileName }}</p>
-            <label class="cursor-pointer text-sm text-brand-600 hover:text-brand-700">
-              Changer de vidéo
-              <input type="file" accept="video/*" class="hidden" @change="onFileInputChange" />
-            </label>
-          </div>
-
-          <!-- Prêt à générer -->
-          <GenerationPanel
-            v-if="status === 'idle'"
-            :partial-info="partialInfo"
-            :duration-seconds="videoDuration"
-            @selection="onSelectionChange"
-            @generate="generateSubtitles"
-          />
-
-          <!-- Traitement en cours -->
-          <div v-if="status === 'processing'" class="flex flex-col gap-3">
-            <div v-if="playbackUnlocked" class="flex items-center gap-2 rounded-xl bg-brand-50 px-4 py-3 text-sm text-brand-900">
-              <AppIcon name="check" class="h-5 w-5 flex-shrink-0 text-brand-600" />
-              <span>Vous pouvez regarder dès maintenant : les sous-titres continuent de se générer en arrière-plan.</span>
-            </div>
-
-            <div class="flex flex-col gap-1.5">
-              <p class="text-sm text-ink-700">
-                <template v-if="processingPhase === 'decoding'">Préparation de l'audio{{ engine === 'online' ? '' : ' et détection de la parole' }}...</template>
-                <template v-else-if="processingPhase === 'loading'">Chargement du modèle IA...</template>
-                <template v-else-if="processingPhase === 'downloading'">
-                  Téléchargement du modèle IA
-                  <span class="text-ink-500">({{ Math.round(modelDownloadProgress) }} %)</span>
-                </template>
-                <template v-else>
-                  {{ engine === 'online' ? 'Transcription en ligne' : 'Génération des sous-titres' }}
-                  <span class="text-ink-500">
-                    ({{ progressPercent }} %<template v-if="etaSeconds !== null"> &middot; {{ formatEta(etaSeconds) }} restantes</template>)
-                  </span>
-                </template>
-              </p>
-
-              <div class="h-2 w-full overflow-hidden rounded-full bg-ink-100">
-                <div
-                  v-if="processingPhase === 'decoding' || processingPhase === 'loading'"
-                  class="indeterminate-bar h-full w-1/3 rounded-full bg-brand-600"
-                ></div>
-                <div
-                  v-else
-                  class="h-full rounded-full bg-brand-600 transition-[width] duration-300"
-                  :style="{ width: (processingPhase === 'downloading' ? Math.round(modelDownloadProgress) : progressPercent) + '%' }"
-                ></div>
-              </div>
-
-              <p v-if="processingPhase === 'downloading'" class="text-xs text-ink-500">
-                Uniquement au premier usage : le modèle sera ensuite disponible hors ligne.
-              </p>
-              <p v-if="processingPhase === 'generating' && silenceSkippedSeconds > 1" class="text-xs text-ink-500">
-                Environ {{ Math.round(silenceSkippedSeconds) }} s sans parole détectée (silence ou musique seule) ignorées.
-              </p>
-            </div>
-          </div>
-
-          <!-- Terminé -->
-          <div v-if="status === 'ready'" class="flex flex-wrap items-center justify-between gap-3">
-            <p class="flex items-center gap-2 text-sm text-ink-600">
-              <AppIcon name="check" class="h-4 w-4 text-brand-600" />
-              {{ !subtitles.length ? 'Aucune parole détectée dans cette vidéo.' : restoredFromCache ? 'Sous-titres restaurés depuis le cache local.' : 'Sous-titres prêts.' }}
-              <span v-if="subtitles.length" class="rounded-full bg-ink-100 px-2 py-0.5 text-xs text-ink-700">
-                {{ LANGUAGE_LABELS[outputLanguage] }}
-              </span>
-            </p>
-            <div v-if="subtitles.length" class="flex gap-2">
-              <button class="btn-secondary !px-3 !py-1.5" @click="exportSubtitles('srt')">
-                <AppIcon name="download" class="h-4 w-4" /> .srt
-              </button>
-              <button class="btn-secondary !px-3 !py-1.5" @click="exportSubtitles('vtt')">
-                <AppIcon name="download" class="h-4 w-4" /> .vtt
-              </button>
-            </div>
-          </div>
-
-          <div v-if="status === 'error'" class="flex flex-col gap-3 rounded-xl bg-red-50 px-4 py-3">
-            <p class="text-sm text-red-700">{{ errorMessage }}</p>
-            <div class="flex flex-wrap gap-2">
-              <button v-if="errorKind === 'auth'" class="btn-secondary !px-3 !py-1.5" @click="backToSettings">Modifier la clé</button>
-              <button v-else-if="engine === 'online'" class="btn-secondary !px-3 !py-1.5" @click="retryGeneration">Réessayer</button>
-              <button v-if="canContinueLocally" class="btn-primary !px-3 !py-1.5" @click="continueInLocal">
-                Terminer en local (anglais)
-              </button>
-              <button v-if="engine === 'local' || errorKind === 'auth'" class="btn-secondary !px-3 !py-1.5" @click="backToSettings">Retour aux réglages</button>
-            </div>
-            <p v-if="canContinueLocally" class="text-xs text-red-700/80">
-              Les sous-titres déjà obtenus sont conservés ; la suite sera générée en anglais, sur votre appareil.
-            </p>
-          </div>
-        </div>
-      </template>
+      <QueuePanel
+        v-if="queue.items.value.length"
+        :items="queue.items.value"
+        :current-id="queue.currentId.value"
+        :running="queueRunning"
+        :has-file="queue.hasFile"
+        @select="selectItem"
+        @remove="removeItem"
+        @clear-done="queue.clearDone"
+        @reopen="reopenItem"
+        @add="pickFiles(false)"
+        @stop="stopQueue"
+      />
     </div>
 
     <TranscriptPanel
@@ -502,6 +795,8 @@ onBeforeUnmount(() => {
       :active-index="activeIndex"
       @seek="seekToSubtitle"
     />
+
+    <input ref="fileInputRef" type="file" multiple :accept="FILE_INPUT_ACCEPT" class="hidden" @change="onFileInputChange" />
   </div>
 </template>
 

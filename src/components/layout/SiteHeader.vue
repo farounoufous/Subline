@@ -1,5 +1,7 @@
 <script setup>
 import AppIcon from '../ui/AppIcon.vue'
+import LanguageSwitch from './LanguageSwitch.vue'
+import { t } from '../../i18n/index.js'
 
 defineProps({
   // 'landing' : navigation par sections + accès à l'application.
@@ -8,9 +10,9 @@ defineProps({
 })
 
 const links = [
-  { label: 'Fonctionnement', href: '/#fonctionnement' },
-  { label: 'Fonctionnalités', href: '/#fonctionnalites' },
-  { label: 'FAQ', href: '/#faq' }
+  { key: 'nav.how', href: '/#fonctionnement' },
+  { key: 'nav.features', href: '/#fonctionnalites' },
+  { key: 'nav.faq', href: '/#faq' }
 ]
 </script>
 
@@ -24,19 +26,22 @@ const links = [
         <span class="text-base font-semibold tracking-tight">Subline</span>
       </a>
 
-      <nav v-if="mode === 'landing'" class="hidden items-center gap-8 md:flex" aria-label="Navigation principale">
+      <nav v-if="mode === 'landing'" class="hidden items-center gap-8 md:flex" :aria-label="t('nav.main')">
         <a
           v-for="link in links"
           :key="link.href"
           :href="link.href"
           class="text-sm text-ink-600 transition-colors hover:text-ink-900"
         >
-          {{ link.label }}
+          {{ t(link.key) }}
         </a>
       </nav>
 
-      <a v-if="mode === 'landing'" href="/app.html" class="btn-primary !px-4 !py-2">Ouvrir l'application</a>
-      <a v-else href="/" class="btn-secondary !px-4 !py-2">Retour à l'accueil</a>
+      <div class="flex items-center gap-3">
+        <LanguageSwitch />
+        <a v-if="mode === 'landing'" href="/app.html" class="btn-primary !px-4 !py-2">{{ t('nav.openApp') }}</a>
+        <a v-else href="/" class="btn-secondary !px-4 !py-2">{{ t('nav.backHome') }}</a>
+      </div>
     </div>
   </header>
 </template>
