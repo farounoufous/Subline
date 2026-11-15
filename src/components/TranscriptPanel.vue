@@ -54,10 +54,8 @@ watch(
 </script>
 
 <template>
-  <!-- Hauteur : celle du lecteur sur grand écran (contenu en absolu pour que
-       une longue liste ne fasse pas grandir la ligne de la grille). -->
-  <section class="relative h-[32rem] overflow-hidden rounded-2xl border border-ink-200 bg-white shadow-card lg:h-auto lg:min-h-[24rem]">
-    <div class="absolute inset-0 flex flex-col">
+  <!-- La coque (bordure, hauteur) est fournie par le conteneur à onglets. -->
+  <div class="flex min-h-0 flex-1 flex-col">
     <header class="border-b border-ink-100 p-4">
       <div class="flex items-center gap-2">
         <AppIcon name="lines" class="h-4 w-4 text-ink-500" />
@@ -69,21 +67,21 @@ watch(
         <span class="text-xs text-ink-600">{{ t('transcript.offset') }}</span>
         <div class="flex items-center gap-1">
           <button
-            class="h-7 w-7 rounded-md border border-ink-200 bg-white text-sm text-ink-700 hover:bg-ink-100"
+            class="h-9 w-9 rounded-md sm:h-7 sm:w-7 border border-ink-200 bg-white text-sm text-ink-700 hover:bg-ink-100"
             :aria-label="t('transcript.earlier')"
             @click="changeOffset(-OFFSET_STEP_SECONDS)"
           >
             -
           </button>
           <button
-            class="w-16 text-center text-xs tabular-nums text-ink-800 hover:text-brand-600"
+            class="h-9 w-16 text-center text-xs tabular-nums text-ink-800 hover:text-brand-600 sm:h-auto"
             :title="t('transcript.reset')"
             @click="emit('update:offset', 0)"
           >
             {{ formatOffset(offset) }}
           </button>
           <button
-            class="h-7 w-7 rounded-md border border-ink-200 bg-white text-sm text-ink-700 hover:bg-ink-100"
+            class="h-9 w-9 rounded-md sm:h-7 sm:w-7 border border-ink-200 bg-white text-sm text-ink-700 hover:bg-ink-100"
             :aria-label="t('transcript.later')"
             @click="changeOffset(OFFSET_STEP_SECONDS)"
           >
@@ -113,6 +111,5 @@ watch(
         </button>
       </li>
     </ol>
-    </div>
-  </section>
+  </div>
 </template>

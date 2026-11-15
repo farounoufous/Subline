@@ -5,7 +5,8 @@
 // seul l'audio compressé (jamais la vidéo) est envoyé.
 
 import { t } from '../i18n/index.js'
-import { recordRateLimitHeaders, recordLimitFromMessage, parseRetryAfterSeconds } from './quota.js'
+import { recordRateLimitHeaders, recordLimitFromMessage, parseRetryAfterSeconds, recordBytesSent } from './quota.js'
+import { network, NETWORK_RETRY_DELAYS, clearNetworkNotice, waitWithCountdown, waitUntilOnline } from './network.js'
 const API_BASE = 'https://api.groq.com/openai/v1'
 
 export const TRANSCRIPTION_MODEL = 'whisper-large-v3'
@@ -78,14 +79,39 @@ async function readErrorMessage(response) {
   }
 }
 
-async function groqFetch(path, buildInit, { apiKey, signal, modelErrors = false }) {
+/** Octets que la requête fait partir (corps seul : les en-têtes sont négligeables). */
+function estimateBodyBytes(body) {
+  if (!body) return 0
+  if (typeof body === 'string') return new Blob([body]).size
+  if (body instanceof FormData) {
+    let total = 0
+    for (const [, value] of body.entries()) total += typeof value === 'string' ? value.length : value.size
+    return total
+  }
+  return body.size || 0
+}
+
+// Enveloppe de groqFetch : les coupures réseau sont réessayées avec des
+// délais croissants (et en attendant le retour de la connexion si
+// l'appareil est hors ligne), puis on abandonne en gardant la progression.
+async function groqFetch(path, buildInit, options) {
+  try {
+    return await groqFetchOnce(path, buildInit, options)
+  } finally {
+    clearNetworkNotice()
+  }
+}
+
+async function groqFetchOnce(path, buildInit, { apiKey, signal, modelErrors = false }) {
   let rateLimitRetries = 0
   let serverErrorRetries = 0
+  let networkRetries = 0
 
   while (true) {
     let response
     try {
       const init = buildInit()
+      recordBytesSent(estimateBodyBytes(init.body))
       response = await fetch(`${API_BASE}${path}`, {
         ...init,
         headers: { Authorization: `Bearer ${apiKey}`, ...(init.headers || {}) },
@@ -93,8 +119,22 @@ async function groqFetch(path, buildInit, { apiKey, signal, modelErrors = false 
       })
     } catch (error) {
       if (error.name === 'AbortError') throw error
-      throw new OnlineError('network', t('err.network'))
+
+      // Hors ligne : on attend le retour du réseau (sans compter d'essai).
+      if (navigator.onLine === false) {
+        network.state = 'offline'
+        await waitUntilOnline(signal)
+        continue
+      }
+      if (networkRetries >= NETWORK_RETRY_DELAYS.length) throw new OnlineError('network', t('err.network'))
+
+      network.state = 'retrying'
+      network.attempt = networkRetries + 1
+      await waitWithCountdown(NETWORK_RETRY_DELAYS[networkRetries], signal)
+      networkRetries++
+      continue
     }
+    clearNetworkNotice()
 
     recordRateLimitHeaders(response.headers)
     if (response.ok) return response
@@ -213,12 +253,11 @@ function splitIntoBatches(texts) {
 }
 
 /**
- * Crée un traducteur de sous-titres. Il garde en mémoire le modèle en
- * cours : une fois le quota du modèle principal atteint, tous les
+ * Client de chat JSON partagé (traduction, résumé). Il garde en mémoire le
+ * modèle en cours : une fois le quota du modèle principal atteint, tous les
  * appels suivants utilisent directement le modèle de repli.
  */
-export function createTranslator({ apiKey, targetLanguage, signal }) {
-  const targetName = LANGUAGE_NAMES[targetLanguage]
+export function createChatClient({ apiKey, signal }) {
   let models = null
   let modelIndex = 0
 
@@ -246,27 +285,21 @@ export function createTranslator({ apiKey, targetLanguage, signal }) {
     return models
   }
 
-  async function callModel(lines) {
+  async function callModel({ system, user, temperature, validate }) {
     const available = await resolveModels()
     const model = available[modelIndex]
-
-    const system =
-      `You are a professional subtitle translator. Translate each subtitle line into ${targetName}. ` +
-      'Preserve meaning, tone and register; keep each line concise and natural for on-screen reading; keep proper names unchanged. ' +
-      'Never merge, split, add or drop lines. If a line is already in ' + targetName + ', return it unchanged. ' +
-      `Reply only with a JSON object {"translations": [...]} holding exactly ${lines.length} strings, in the same order.`
 
     const buildInit = () => ({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: model.id,
-        temperature: 0.2,
+        temperature,
         response_format: { type: 'json_object' },
         ...model.extra,
         messages: [
           { role: 'system', content: system },
-          { role: 'user', content: JSON.stringify({ lines }) }
+          { role: 'user', content: user }
         ]
       })
     })
@@ -280,24 +313,21 @@ export function createTranslator({ apiKey, targetLanguage, signal }) {
       .replace(/<think>[\s\S]*?<\/think>/g, '')
       .replace(/^```(?:json)?\s*|\s*```$/g, '')
       .trim()
-    const parsed = JSON.parse(content)
-    if (!Array.isArray(parsed.translations) || parsed.translations.length !== lines.length) {
-      throw new OnlineError('other', t('err.unexpectedTranslation'))
-    }
-    return parsed.translations.map((item, i) => (typeof item === 'string' && item.trim() ? item.trim() : lines[i]))
+    return validate(JSON.parse(content))
   }
 
-  // Un lot : passe au modèle suivant si le quota est atteint ou si le
-  // modèle est indisponible ; en cas de réponse mal formée, on scinde le
-  // lot jusqu'à la ligne seule, puis on conserve le texte d'origine plutôt
-  // que de perdre le sous-titre.
-  async function translateBatch(lines) {
+  /**
+   * Demande une réponse JSON. Passe au modèle suivant si le quota est
+   * atteint ou si le modèle est indisponible. Une réponse mal formée
+   * (JSON invalide ou refusé par `validate`) est remontée à l'appelant,
+   * qui décide quoi faire (scinder le lot, réessayer...).
+   */
+  return async function completeJson({ system, user, temperature = 0.2, validate }) {
     while (true) {
       try {
-        return await callModel(lines)
+        return await callModel({ system, user, temperature, validate })
       } catch (error) {
         if (error.name === 'AbortError') throw error
-
         if (error instanceof OnlineError && (error.kind === 'quota' || error.kind === 'model')) {
           const lastIndex = (models?.length || 1) - 1
           if (modelIndex < lastIndex) {
@@ -305,16 +335,52 @@ export function createTranslator({ apiKey, targetLanguage, signal }) {
             continue
           }
           if (error.kind === 'model') {
-            throw new OnlineError('other', t('err.noModel', { detail: error.message }))
+            throw new OnlineError('nomodel', t('err.noModel', { detail: error.message }))
           }
-          throw error
         }
-        if (error instanceof OnlineError && error.kind !== 'other') throw error
-
-        if (lines.length === 1) return lines
-        const middle = Math.ceil(lines.length / 2)
-        return [...(await translateBatch(lines.slice(0, middle))), ...(await translateBatch(lines.slice(middle)))]
+        throw error
       }
+    }
+  }
+}
+
+/** Crée un traducteur de sous-titres (lots de lignes, repli de modèle, découpage si réponse mal formée). */
+export function createTranslator({ apiKey, targetLanguage, signal }) {
+  const targetName = LANGUAGE_NAMES[targetLanguage]
+  const completeJson = createChatClient({ apiKey, signal })
+
+  async function callModel(lines) {
+    const system =
+      `You are a professional subtitle translator. Translate each subtitle line into ${targetName}. ` +
+      'Preserve meaning, tone and register; keep each line concise and natural for on-screen reading; keep proper names unchanged. ' +
+      'Never merge, split, add or drop lines. If a line is already in ' + targetName + ', return it unchanged. ' +
+      `Reply only with a JSON object {"translations": [...]} holding exactly ${lines.length} strings, in the same order.`
+
+    return completeJson({
+      system,
+      user: JSON.stringify({ lines }),
+      validate(parsed) {
+        if (!Array.isArray(parsed.translations) || parsed.translations.length !== lines.length) {
+          throw new OnlineError('other', t('err.unexpectedTranslation'))
+        }
+        return parsed.translations.map((item, i) => (typeof item === 'string' && item.trim() ? item.trim() : lines[i]))
+      }
+    })
+  }
+
+  // Un lot : en cas de réponse mal formée, on scinde jusqu'à la ligne
+  // seule, puis on conserve le texte d'origine plutôt que de perdre le
+  // sous-titre.
+  async function translateBatch(lines) {
+    try {
+      return await callModel(lines)
+    } catch (error) {
+      if (error.name === 'AbortError') throw error
+      if (error instanceof OnlineError && error.kind !== 'other') throw error
+
+      if (lines.length === 1) return lines
+      const middle = Math.ceil(lines.length / 2)
+      return [...(await translateBatch(lines.slice(0, middle))), ...(await translateBatch(lines.slice(middle)))]
     }
   }
 

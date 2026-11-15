@@ -4,6 +4,7 @@ import AppIcon from './ui/AppIcon.vue'
 import QuotaMeter from './QuotaMeter.vue'
 import { t } from '../i18n/index.js'
 import { probeSubtitleTracks } from '../audio/embedded-subtitles.js'
+import { detectDevice } from '../utils/device.js'
 import { MODEL_DOWNLOAD_SIZE_LABEL } from '../audio/constants.js'
 import { ONLINE_AUDIO_BITRATE_KBPS } from '../audio/audio-stream.js'
 
@@ -70,6 +71,9 @@ const BADGE_CLASSES = {
   online: 'bg-amber-100 text-amber-800',
   embedded: 'bg-amber-100 text-amber-800'
 }
+
+// Appareil limité (téléphone, peu de mémoire) : le mode Local y est déconseillé.
+const limitedDevice = detectDevice().limited
 
 const sourceOptions = computed(() => [
   { value: 'english', label: t('local.sourceEnglish') },
@@ -205,13 +209,17 @@ function submit(all = false) {
             :key="option.value"
             role="radio"
             :aria-checked="sourceMode === option.value"
-            class="rounded-md px-3 py-1.5 text-sm transition-colors"
+            class="rounded-md px-3 py-2 text-sm transition-colors sm:py-1.5"
             :class="sourceMode === option.value ? 'bg-brand-600 text-white' : 'text-ink-600 hover:text-ink-900'"
             @click="sourceMode = option.value"
           >
             {{ option.label }}
           </button>
         </div>
+      </div>
+      <div v-if="limitedDevice" class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-relaxed text-amber-900" data-testid="limited-warning">
+        <p>{{ t('local.limitedWarning') }}</p>
+        <button class="mt-2 font-medium text-brand-700 hover:text-brand-800" @click="engine = 'online'">{{ t('local.switchToOnline') }}</button>
       </div>
       <p class="text-sm text-ink-600">{{ t('local.modelNote', { size: MODEL_DOWNLOAD_SIZE_LABEL }) }}</p>
     </div>
@@ -247,7 +255,7 @@ function submit(all = false) {
             :key="option.value"
             role="radio"
             :aria-checked="targetLanguage === option.value"
-            class="rounded-md px-3 py-1.5 text-sm transition-colors"
+            class="rounded-md px-3 py-2 text-sm transition-colors sm:py-1.5"
             :class="targetLanguage === option.value ? 'bg-brand-600 text-white' : 'text-ink-600 hover:text-ink-900'"
             @click="targetLanguage = option.value"
           >

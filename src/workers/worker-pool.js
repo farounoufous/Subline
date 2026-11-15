@@ -15,9 +15,13 @@
 // un premier lancement (cache vide) téléchargerait les mêmes poids en
 // double, triple...
 
+import { detectDevice } from '../utils/device.js'
 const MAX_WORKERS = 3
 
 function pickWorkerCount() {
+  // Un seul worker sur un appareil limité : chaque worker charge sa propre
+  // copie du modèle, ce qui épuise vite la mémoire d'un téléphone.
+  if (detectDevice().limited) return 1
   const availableCores = navigator.hardwareConcurrency || 2
   return Math.max(1, Math.min(MAX_WORKERS, availableCores))
 }

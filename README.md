@@ -28,6 +28,14 @@ Utiliser `build` + `preview` (pas `npm run dev`) pour tester le chargement des m
 - **Jamais persisté** : le moteur (local par défaut) et le consentement d'envoi. Une clé API n'est gardée que si « Mémoriser » est coché.
 - **Quota Groq** : `src/online/quota.js`. Journal local des secondes d'audio envoyées, croisé avec les limites réelles lues dans les erreurs 429 (« Limit 7200, Used... ») et les en-têtes `x-ratelimit-*` quand le navigateur peut les lire. Limites par défaut : 7 200 s/heure, 28 800 s/jour (palier gratuit documenté).
 
+## Réseau instable, résumé et téléphone
+
+- **Reprise réseau** : `src/online/network.js` + `groqFetch`. Une coupure est réessayée 6 fois (2, 5, 10, 20, 30, 30 s) avec compte à rebours affiché ; hors connexion (`navigator.onLine`), l'appli attend l'évènement `online` sans compter d'essai. La progression est déjà sauvegardée par fenêtre, rien n'est refait.
+- **Données envoyées** : `recordBytesSent` (quota.js) compte le corps de chaque requête vers Groq (aujourd'hui, ce mois-ci, par fichier). Estimation : les en-têtes et les réponses ne sont pas comptés.
+- **Résumé et chapitres** : `src/online/summary.js`. La transcription est découpée en parties d'environ 9 000 caractères (limite par minute du palier gratuit), chaque partie donne résumé + chapitres, puis un appel fusionne les résumés. Les chapitres hors de l'extrait sont écartés, ceux à moins de 45 s sont fusionnés. Le résultat est stocké avec les sous-titres (champ `outline`). Seul le texte est envoyé.
+- **Client de chat partagé** : `createChatClient` (groq-client.js) porte la résolution des modèles et le repli ; le traducteur et le résumé l'utilisent.
+- **Téléphone** : `src/utils/device.js` repère les appareils limités (mobile, 4 Go ou moins, 2 cœurs ou moins) : avertissement dans le mode Local avec bouton vers le mode En ligne, un seul worker Whisper. Local reste le mode par défaut. Mise en page adaptée, cibles tactiles agrandies, plein écran natif quand l'élément ne peut pas l'être (iOS).
+
 ## Architecture
 
 - `index.html` : page d'accueil. `app.html` : application (page séparée).

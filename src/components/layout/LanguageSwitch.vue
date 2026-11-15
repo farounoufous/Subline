@@ -8,7 +8,7 @@ import { locale, setLocale, SUPPORTED_LOCALES, t } from '../../i18n/index.js'
       v-for="code in SUPPORTED_LOCALES"
       :key="code"
       type="button"
-      class="rounded-md px-2.5 py-1 uppercase transition-colors"
+      class="rounded-md px-3 py-2 uppercase transition-colors sm:px-2.5 sm:py-1"
       :class="locale === code ? 'bg-brand-600 text-white' : 'text-ink-600 hover:text-ink-900'"
       :aria-pressed="locale === code"
       @click="setLocale(code)"

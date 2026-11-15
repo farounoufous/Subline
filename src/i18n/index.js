@@ -26,7 +26,7 @@ export const locale = ref(detectInitialLocale())
 watch(
   locale,
   (value) => {
-    document.documentElement.lang = value
+    if (typeof document !== 'undefined') document.documentElement.lang = value
     try {
       localStorage.setItem(STORAGE_KEY, value)
     } catch {

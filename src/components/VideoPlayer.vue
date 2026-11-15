@@ -8,11 +8,17 @@ import { useVideoHistory } from '../db/useVideoHistory.js'
 import { useQueue } from '../db/useQueue.js'
 import { useSubtitleGeneration } from '../composables/useSubtitleGeneration.js'
 import { probeSubtitleTracks } from '../audio/embedded-subtitles.js'
-import { t } from '../i18n/index.js'
+import { network } from '../online/network.js'
+import { quota } from '../online/quota.js'
+import { formatMegabytes } from '../utils/format-bytes.js'
+import { isTouchDevice } from '../utils/device.js'
+import { t, locale } from '../i18n/index.js'
+import { generateOutline } from '../online/summary.js'
 import AppIcon from './ui/AppIcon.vue'
 import TranscriptPanel from './TranscriptPanel.vue'
 import GenerationPanel from './GenerationPanel.vue'
 import QueuePanel from './QueuePanel.vue'
+import OutlinePanel from './OutlinePanel.vue'
 
 const CACHED_LANGUAGES = ['en', 'fr', 'mixed']
 const POSITION_KEY_PREFIX = 'subline:position:'
@@ -50,6 +56,11 @@ const fileName = ref('')
 const currentKind = ref('video')
 const currentFile = ref(null)
 const isDraggingOver = ref(false)
+// Appareil tactile : on propose de choisir plutôt que de glisser.
+const touchDevice = isTouchDevice()
+// iOS Safari ne sait pas mettre un <div> en plein écran : on laisse alors
+// le plein écran natif du lecteur (les sous-titres y disparaissent, faute de mieux).
+const canFullscreenContainer = typeof document !== 'undefined' && Boolean(document.fullscreenEnabled)
 const isFullscreen = ref(false)
 const restoredFromCache = ref(false)
 const showCatchUpPrompt = ref(false)
@@ -57,6 +68,15 @@ const dropNotice = ref('')
 const queueRunning = ref(false)
 // Durée du média, réactive (l'élément <video> ne l'est pas).
 const videoDuration = ref(0)
+
+// --- Résumé et chapitres ---
+const rightTab = ref('transcript')
+const outline = ref(null)
+const outlineBusy = ref(false)
+const outlineProgress = ref({ done: 0, total: 0 })
+const outlineError = ref('')
+const playhead = ref(0)
+let outlineController = null
 
 const activeIndex = ref(-1)
 const activeSubtitleText = ref('')
@@ -67,6 +87,8 @@ const subtitleOffset = ref(0)
 // progression interrompue) et derniers paramètres, pour pouvoir réessayer.
 let currentPartialMode = 'english'
 let lastOptions = null
+// Dernière clé utilisée (réactive) : évite de la ressaisir pour le résumé.
+const lastApiKey = ref('')
 
 let objectUrl = null
 let currentFingerprint = null
@@ -96,6 +118,7 @@ function toggleVideoPlayback() {
 
 function updateActiveSubtitle() {
   if (!videoRef.value) return
+  playhead.value = videoRef.value.currentTime
   const time = videoRef.value.currentTime - subtitleOffset.value
   const index = subtitles.value.findIndex((s) => time >= s.startTime && time < s.endTime)
   activeIndex.value = index
@@ -207,6 +230,7 @@ async function checkCache(fingerprint) {
   if (!cached || fingerprint !== currentFingerprint) return
 
   generation.restoreFromCache(cached)
+  outline.value = cached.outline || null
   restoredFromCache.value = true
   // Un fichier restauré après rechargement ne démarre pas tout seul :
   // la lecture reprend à la position mémorisée, sur demande.
@@ -263,7 +287,13 @@ function waitForMetadata() {
   })
 }
 
+// Octets déjà envoyés au début de la génération en cours (pour le compteur du fichier).
+const runBaseBytes = ref(0)
+const runBytes = computed(() => Math.max(0, quota.sessionBytes - runBaseBytes.value))
+
 function prepareRun() {
+  runBaseBytes.value = quota.sessionBytes
+  resetOutline()
   restoredFromCache.value = false
   showCatchUpPrompt.value = false
   bypassCatchUpCheck = false
@@ -314,6 +344,7 @@ async function resolveEmbeddedTrack(file) {
 
 function generateSubtitles(options) {
   lastOptions = options
+  lastApiKey.value = options.apiKey || ''
   return runGeneration(async ({ fingerprint, file, durationHint }) => {
     if (options.engine === 'online') {
       return generation.startOnline(file, {
@@ -361,6 +392,56 @@ function continueInLocal() {
   )
 }
 
+function resetOutline() {
+  outlineController?.abort()
+  outline.value = null
+  outlineBusy.value = false
+  outlineError.value = ''
+  outlineProgress.value = { done: 0, total: 0 }
+}
+
+// Langue du résumé : celle des sous-titres, sinon celle de l'interface.
+function outlineLanguage() {
+  return outputLanguage.value === 'fr' || outputLanguage.value === 'en' ? outputLanguage.value : locale.value
+}
+
+async function createOutline({ apiKey }) {
+  outlineController?.abort()
+  outlineController = new AbortController()
+  const controller = outlineController
+  const fingerprint = currentFingerprint
+  const language = outputLanguage.value
+  outlineBusy.value = true
+  outlineError.value = ''
+  outlineProgress.value = { done: 0, total: 0 }
+  const base = quota.sessionBytes
+  try {
+    const result = await generateOutline(subtitles.value, {
+      apiKey,
+      language: outlineLanguage(),
+      signal: controller.signal,
+      onProgress: (done, total) => {
+        outlineProgress.value = { done, total }
+      }
+    })
+    if (controller.signal.aborted || fingerprint !== currentFingerprint) return
+    outline.value = result
+    // Mémorisé avec les sous-titres : disponible après un rechargement.
+    const record = await getProcessedVideo(subtitleCacheKey(fingerprint, language)).catch(() => null)
+    if (record) await saveProcessedVideo({ ...record, outline: JSON.parse(JSON.stringify(result)) }).catch(() => {})
+  } catch (error) {
+    if (error.name === 'AbortError') return
+    outlineError.value = error.message
+  } finally {
+    if (outlineController === controller) outlineBusy.value = false
+  }
+}
+
+function seekToTime(seconds) {
+  if (!videoRef.value) return
+  videoRef.value.currentTime = Math.max(0, seconds + subtitleOffset.value)
+}
+
 function backToSettings() {
   generation.reset()
   refreshPartialInfo()
@@ -384,6 +465,7 @@ function loadFile(file, id) {
   restoredFromCache.value = false
   showCatchUpPrompt.value = false
   bypassCatchUpCheck = false
+  resetOutline()
   subtitleOffset.value = 0
   videoDuration.value = 0
   dropNotice.value = ''
@@ -447,7 +529,6 @@ function addFiles(entries, { open = true } = {}) {
 let openAfterPick = true
 
 async function pickFiles(open = true) {
-  openAfterPick = open
   if (typeof window.showOpenFilePicker === 'function') {
     try {
       const handles = await window.showOpenFilePicker({ multiple: true, types: PICKER_TYPES })
@@ -459,6 +540,8 @@ async function pickFiles(open = true) {
     }
     return
   }
+  // Repli sans File System Access : le choix passe par le champ fichier.
+  openAfterPick = open
   fileInputRef.value?.click()
 }
 
@@ -498,6 +581,7 @@ function outputLanguageFor(options) {
 async function runQueue(options) {
   if (queueRunning.value) return
   lastOptions = options
+  lastApiKey.value = options.apiKey || ''
   queueRunning.value = true
   stopRequested = false
 
@@ -597,7 +681,7 @@ onBeforeUnmount(() => {
         <!-- Zone de dépôt -->
         <div
           v-if="!videoSrc"
-          class="flex flex-col items-center justify-center gap-4 px-6 py-20 text-center transition-colors"
+          class="flex flex-col items-center justify-center gap-4 px-6 py-14 text-center transition-colors sm:py-20"
           :class="isDraggingOver ? 'bg-brand-50' : 'bg-white'"
         >
           <span class="flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-50 text-brand-600">
@@ -617,7 +701,7 @@ onBeforeUnmount(() => {
 
           <template v-else>
             <div>
-              <p class="text-lg font-semibold text-ink-900">{{ t('drop.title') }}</p>
+              <p class="text-lg font-semibold text-ink-900">{{ touchDevice ? t('drop.titleTouch') : t('drop.title') }}</p>
               <p class="mt-1 text-sm text-ink-500">{{ t('drop.hint') }}</p>
             </div>
             <button class="btn-primary" @click="pickFiles()">{{ t('drop.choose') }}</button>
@@ -632,7 +716,7 @@ onBeforeUnmount(() => {
               ref="videoRef"
               :src="videoSrc"
               controls
-              controlsList="nofullscreen"
+              :controlslist="canFullscreenContainer ? 'nofullscreen' : null"
               class="block w-full bg-black"
               :class="isAudio ? 'h-56' : isFullscreen ? 'h-screen object-contain' : 'max-h-[70vh]'"
               @timeupdate="onTimeUpdate"
@@ -658,8 +742,8 @@ onBeforeUnmount(() => {
             </div>
 
             <button
-              v-if="!isAudio"
-              class="absolute right-3 top-3 flex h-9 w-9 items-center justify-center rounded-lg bg-black/50 text-white opacity-0 transition-opacity focus:opacity-100 group-hover:opacity-100"
+              v-if="!isAudio && canFullscreenContainer"
+              class="absolute right-3 top-3 flex h-10 w-10 items-center justify-center rounded-lg bg-black/50 text-white transition-opacity focus:opacity-100 sm:h-9 sm:w-9 sm:opacity-0 sm:group-hover:opacity-100"
               :aria-label="isFullscreen ? t('player.exitFullscreen') : t('player.fullscreen')"
               @click="toggleFullscreen"
             >
@@ -681,7 +765,7 @@ onBeforeUnmount(() => {
           <div class="flex flex-col gap-4 p-5">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p class="truncate text-sm font-medium text-ink-900" :title="fileName">{{ fileName }}</p>
-              <button class="text-sm text-brand-600 hover:text-brand-700" @click="pickFiles()">{{ t('player.changeFile') }}</button>
+              <button class="-my-2 py-2 text-sm text-brand-600 hover:text-brand-700" @click="pickFiles()">{{ t('player.changeFile') }}</button>
             </div>
 
             <!-- Prêt à générer -->
@@ -731,6 +815,15 @@ onBeforeUnmount(() => {
                   ></div>
                 </div>
 
+                <p v-if="network.state === 'retrying'" class="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900" role="status">
+                  {{ t('net.retrying', { seconds: network.seconds, attempt: network.attempt, max: network.maxAttempts }) }}
+                </p>
+                <p v-else-if="network.state === 'offline'" class="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900" role="status">
+                  {{ t('net.offline') }}
+                </p>
+                <p v-if="engine !== 'local' && runBytes > 0" class="text-xs text-ink-500">
+                  {{ t('data.sentRun', { size: formatMegabytes(runBytes) }) }}
+                </p>
                 <p v-if="processingPhase === 'downloading'" class="text-xs text-ink-500">{{ t('phase.downloadingHint') }}</p>
                 <p v-if="processingPhase === 'generating' && silenceSkippedSeconds > 1" class="text-xs text-ink-500">
                   {{ t('phase.silence', { seconds: Math.round(silenceSkippedSeconds) }) }}
@@ -788,13 +881,49 @@ onBeforeUnmount(() => {
       />
     </div>
 
-    <TranscriptPanel
+    <section
       v-if="videoSrc"
-      v-model:offset="subtitleOffset"
-      :subtitles="subtitles"
-      :active-index="activeIndex"
-      @seek="seekToSubtitle"
-    />
+      class="relative h-[32rem] overflow-hidden rounded-2xl border border-ink-200 bg-white shadow-card lg:h-auto lg:min-h-[24rem]"
+    >
+      <div class="absolute inset-0 flex flex-col">
+        <div class="flex gap-1 border-b border-ink-100 px-2 pt-2" role="tablist">
+          <button
+            v-for="tab in ['transcript', 'outline']"
+            :key="tab"
+            role="tab"
+            :aria-selected="rightTab === tab"
+            class="rounded-t-lg px-3 py-2 text-sm font-medium transition-colors"
+            :class="rightTab === tab ? 'bg-brand-50 text-brand-700' : 'text-ink-500 hover:text-ink-800'"
+            :data-testid="'tab-' + tab"
+            @click="rightTab = tab"
+          >
+            {{ t('tab.' + tab) }}
+          </button>
+        </div>
+
+        <TranscriptPanel
+          v-show="rightTab === 'transcript'"
+          v-model:offset="subtitleOffset"
+          :subtitles="subtitles"
+          :active-index="activeIndex"
+          @seek="seekToSubtitle"
+        />
+        <OutlinePanel
+          v-show="rightTab === 'outline'"
+          :outline="outline"
+          :available="status === 'ready' && subtitles.length > 0"
+          :busy="outlineBusy"
+          :progress="outlineProgress"
+          :error="outlineError"
+          :known-key="lastApiKey"
+          :playhead="playhead"
+          @generate="createOutline"
+          @seek="seekToTime"
+          @cancel="resetOutline"
+          @reset="outline = null"
+        />
+      </div>
+    </section>
 
     <input ref="fileInputRef" type="file" multiple :accept="FILE_INPUT_ACCEPT" class="hidden" @change="onFileInputChange" />
   </div>

@@ -33,11 +33,11 @@ const STATUS_CLASSES = {
         <span class="text-xs text-ink-400">{{ items.length === 1 ? t('queue.countOne') : t('queue.count', { count: items.length }) }}</span>
       </div>
       <div class="flex items-center gap-3 text-sm">
-        <button v-if="running" class="text-red-600 hover:text-red-700" @click="$emit('stop')">{{ t('queue.stop') }}</button>
+        <button v-if="running" class="-my-2 py-2 text-red-600 hover:text-red-700" @click="$emit('stop')">{{ t('queue.stop') }}</button>
         <button v-if="items.some((item) => item.status === 'done')" class="text-ink-500 hover:text-ink-800" @click="$emit('clear-done')">
           {{ t('queue.clearDone') }}
         </button>
-        <button class="text-brand-600 hover:text-brand-700" @click="$emit('add')">{{ t('player.addFiles') }}</button>
+        <button class="-my-2 py-2 text-brand-600 hover:text-brand-700" @click="$emit('add')">{{ t('player.addFiles') }}</button>
       </div>
     </div>
 

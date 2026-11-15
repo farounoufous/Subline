@@ -2,6 +2,7 @@
 import { onMounted, onBeforeUnmount } from 'vue'
 import { quota, refreshQuota } from '../online/quota.js'
 import { t } from '../i18n/index.js'
+import { formatMegabytes } from '../utils/format-bytes.js'
 
 let timer = null
 onMounted(() => {
@@ -36,6 +37,18 @@ const minutes = (seconds) => Math.round(seconds / 60)
           :class="percent(row.used, row.limit) >= 90 ? 'bg-red-500' : percent(row.used, row.limit) >= 70 ? 'bg-amber-500' : 'bg-brand-600'"
           :style="{ width: percent(row.used, row.limit) + '%' }"
         ></div>
+      </div>
+    </div>
+
+    <div class="mt-3 border-t border-ink-100 pt-2">
+      <p class="text-xs font-medium text-ink-900">{{ t('quota.data') }}</p>
+      <div class="mt-1 flex items-center justify-between text-xs text-ink-600">
+        <span>{{ t('quota.dataToday') }}</span>
+        <span class="tabular-nums">{{ formatMegabytes(quota.dataToday) }}</span>
+      </div>
+      <div class="flex items-center justify-between text-xs text-ink-600">
+        <span>{{ t('quota.dataMonth') }}</span>
+        <span class="tabular-nums">{{ formatMegabytes(quota.dataMonth) }}</span>
       </div>
     </div>
 

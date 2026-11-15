@@ -16,6 +16,8 @@ import { reactive } from 'vue'
 
 const LOG_KEY = 'subline:audio-log'
 const SERVER_KEY = 'subline:quota-server'
+const DATA_KEY = 'subline:data-sent'
+const DATA_RETENTION_DAYS = 62
 const HOUR = 3600
 const DAY = 86400
 // Valeurs documentées du palier gratuit pour whisper-large-v3.
@@ -28,7 +30,11 @@ export const quota = reactive({
   usedDay: 0,
   limitHour: DEFAULT_LIMITS.hour,
   limitDay: DEFAULT_LIMITS.day,
-  requestsLeft: null
+  requestsLeft: null,
+  // Données envoyées (octets) : aujourd'hui, ce mois-ci, depuis le chargement de la page.
+  dataToday: 0,
+  dataMonth: 0,
+  sessionBytes: 0
 })
 
 function readJson(key, fallback) {
@@ -63,6 +69,32 @@ export function refreshQuota() {
   quota.usedHour = Math.max(localHour, fresh(server.hour, HOUR) ? server.hour.used : 0)
   quota.usedDay = Math.max(localDay, fresh(server.day, DAY) ? server.day.used : 0)
   quota.requestsLeft = fresh(server.requests, DAY) ? server.requests.left : null
+
+  const data = readJson(DATA_KEY, {})
+  const today = dayKey(new Date())
+  quota.dataToday = data[today] || 0
+  quota.dataMonth = Object.entries(data)
+    .filter(([key]) => key.startsWith(today.slice(0, 7)))
+    .reduce((sum, [, bytes]) => sum + bytes, 0)
+}
+
+// Clé de jour locale (AAAA-MM-JJ) : "aujourd'hui" suit le fuseau de l'utilisateur.
+function dayKey(date) {
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/** À appeler pour chaque requête qui envoie des données à Groq. */
+export function recordBytesSent(bytes) {
+  if (!(bytes > 0)) return
+  const data = readJson(DATA_KEY, {})
+  const today = dayKey(new Date())
+  data[today] = (data[today] || 0) + bytes
+  const oldest = dayKey(new Date(Date.now() - DATA_RETENTION_DAYS * DAY * 1000))
+  for (const key of Object.keys(data)) if (key < oldest) delete data[key]
+  writeJson(DATA_KEY, data)
+  quota.sessionBytes += bytes
+  refreshQuota()
 }
 
 /** À appeler après chaque transcription réussie. */

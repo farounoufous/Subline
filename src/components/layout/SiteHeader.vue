@@ -18,7 +18,7 @@ const links = [
 
 <template>
   <header class="sticky top-0 z-30 border-b border-ink-100 bg-white/80 backdrop-blur">
-    <div class="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
+    <div class="mx-auto flex h-16 max-w-6xl items-center justify-between gap-2 px-4 sm:px-6">
       <a href="/" class="flex items-center gap-2.5 text-ink-900">
         <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-600 text-white">
           <AppIcon name="lines" class="h-4 w-4" />
@@ -37,10 +37,16 @@ const links = [
         </a>
       </nav>
 
-      <div class="flex items-center gap-3">
+      <div class="flex items-center gap-2 sm:gap-3">
         <LanguageSwitch />
-        <a v-if="mode === 'landing'" href="/app.html" class="btn-primary !px-4 !py-2">{{ t('nav.openApp') }}</a>
-        <a v-else href="/" class="btn-secondary !px-4 !py-2">{{ t('nav.backHome') }}</a>
+        <a v-if="mode === 'landing'" href="/app.html" class="btn-primary !px-4 !py-2 whitespace-nowrap">
+          <span class="sm:hidden">{{ t('nav.openAppShort') }}</span>
+          <span class="hidden sm:inline">{{ t('nav.openApp') }}</span>
+        </a>
+        <a v-else href="/" class="btn-secondary !px-4 !py-2 whitespace-nowrap">
+          <span class="sm:hidden">{{ t('nav.backHomeShort') }}</span>
+          <span class="hidden sm:inline">{{ t('nav.backHome') }}</span>
+        </a>
       </div>
     </div>
   </header>

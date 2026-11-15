@@ -13,7 +13,7 @@ watchEffect(() => {
 <template>
   <div class="min-h-screen bg-ink-50/60">
     <SiteHeader mode="app" />
-    <main class="mx-auto max-w-6xl px-6 py-8">
+    <main class="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <VideoPlayer />
       <VideoHistory class="mt-6" />
     </main>
