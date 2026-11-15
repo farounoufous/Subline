@@ -36,8 +36,8 @@ const KNOWN_HALLUCINATIONS = [
   'a la prochaine pour une nouvelle video'
 ]
 
-// Une formule n'est écartée que si elle occupe l'essentiel de la ligne :
-// un vrai « merci d'avoir regardé » au milieu d'une longue phrase reste.
+// Une formule n'est écartée que si elle ouvre ou clôt la ligne et en occupe
+// l'essentiel : un vrai « merci d'avoir regardé » au milieu d'une phrase reste.
 const PHRASE_EXTRA_WORDS_ALLOWED = 6
 
 // Mentions qui ne sont jamais de la parole réelle : écartées où qu'elles soient.
@@ -57,18 +57,34 @@ export function normalizeText(text) {
     .trim()
 }
 
-// Même mot 5 fois de suite, ou même groupe de mots répété 4 fois ou
-// plus : boucle de répétition typique d'un décodage qui déraille.
+// Boucle de répétition typique d'un décodage qui déraille : un même mot
+// 8 fois de suite, ou un même groupe de 2 à 6 mots répété 5 fois ou plus.
+// Les seuils sont volontairement hauts : la vraie parole répète parfois
+// (« non non non non non ») ; une hallucination boucle bien plus longtemps.
+// Détection par mots, sans expression régulière à lookbehind (non
+// supportée par les Safari antérieurs à 16.4).
+const MAX_WORD_RUN = 8
+const MAX_GROUP_REPEATS = 5
+
 function hasRunawayRepetition(normalized) {
   const words = normalized.split(' ')
+
   let run = 1
   for (let i = 1; i < words.length; i++) {
     run = words[i] === words[i - 1] ? run + 1 : 1
-    if (run >= 5) return true
+    if (run >= MAX_WORD_RUN) return true
   }
-  // \b est limité à l'ASCII en JavaScript : « là » ou « été » en fin de
-  // groupe échapperaient à la détection. On borne avec des classes Unicode.
-  return /((?<![\p{L}\p{N}'])[\p{L}\p{N}']+(?: [\p{L}\p{N}']+){1,5}(?![\p{L}\p{N}']))(?: \1){3,}/u.test(normalized)
+
+  // Un groupe de `size` mots répété R fois correspond à une suite de
+  // size × (R - 1) mots identiques à ceux situés `size` positions avant.
+  for (let size = 2; size <= 6; size++) {
+    let matches = 0
+    for (let i = size; i < words.length; i++) {
+      matches = words[i] === words[i - size] ? matches + 1 : 0
+      if (matches >= size * (MAX_GROUP_REPEATS - 1)) return true
+    }
+  }
+  return false
 }
 
 export function isLikelyHallucination(text) {
@@ -78,7 +94,9 @@ export function isLikelyHallucination(text) {
   const normalized = normalizeText(trimmed)
   const wordCount = normalized.split(' ').length
   const isKnownPhrase = KNOWN_HALLUCINATIONS.some(
-    (phrase) => normalized.includes(phrase) && wordCount <= phrase.split(' ').length + PHRASE_EXTRA_WORDS_ALLOWED
+    (phrase) =>
+      (normalized.startsWith(phrase) || normalized.endsWith(phrase)) &&
+      wordCount <= phrase.split(' ').length + PHRASE_EXTRA_WORDS_ALLOWED
   )
   if (isKnownPhrase || ALWAYS_HALLUCINATION.some((phrase) => normalized.includes(phrase))) return true
   return hasRunawayRepetition(normalized)

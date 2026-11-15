@@ -249,6 +249,8 @@ async function persistResult(fingerprint, file) {
     language,
     engine: engine.value,
     subtitles: subtitles.value,
+    // Passages non traités : le bandeau de reprise reste disponible après rechargement.
+    failedSegments: failedSegments.value,
     thumbnailDataUrl,
     createdAt: Date.now()
   })

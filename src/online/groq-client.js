@@ -41,7 +41,16 @@ const MAX_SERVER_ERROR_RETRIES = 2
 // se fige sans erreur bloquerait la file indéfiniment. Un dépassement est
 // traité comme une coupure réseau (nouvelle tentative avec compte à rebours).
 // La transcription est large : elle envoie ~1,3 Mo sur une liaison lente.
-const TIMEOUT_TRANSCRIPTION_MS = 180_000
+const TIMEOUT_TRANSCRIPTION_MIN_MS = 90_000
+const TIMEOUT_TRANSCRIPTION_MAX_MS = 600_000
+// Débit minimal toléré pour l'envoi (octets/s) : le délai s'allonge avec la
+// taille du fichier au lieu de couper un envoi lent mais qui progresse.
+const MIN_UPLOAD_BYTES_PER_SECOND = 4 * 1024
+
+function transcriptionTimeoutMs(bytes) {
+  const needed = 30_000 + (bytes / MIN_UPLOAD_BYTES_PER_SECOND) * 1000
+  return Math.min(TIMEOUT_TRANSCRIPTION_MAX_MS, Math.max(TIMEOUT_TRANSCRIPTION_MIN_MS, needed))
+}
 const TIMEOUT_DEFAULT_MS = 90_000
 
 // Seuils habituels de Whisper pour écarter les segments non fiables.
@@ -192,6 +201,25 @@ async function groqFetchOnce(path, buildInit, { apiKey, signal, modelErrors = fa
   }
 }
 
+// Lecture du corps de la réponse avec un délai : les en-têtes peuvent arriver
+// puis le corps se figer. Un dépassement est signalé comme une coupure réseau
+// (la progression déjà obtenue est conservée).
+async function readJsonWithTimeout(response, signal, timeoutMs = TIMEOUT_DEFAULT_MS) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new OnlineError('network', t('err.network'))), timeoutMs)
+  })
+  try {
+    return await Promise.race([response.json(), timeout])
+  } catch (error) {
+    if (signal?.aborted) throw new DOMException('Annulé', 'AbortError')
+    if (error instanceof OnlineError) throw error
+    throw new OnlineError('network', t('err.network'))
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 function isReliableSegment(segment) {
   if (segment.noSpeechProb > NO_SPEECH_PROB_THRESHOLD && segment.avgLogprob < LOW_LOGPROB_THRESHOLD) return false
   if (segment.compressionRatio > COMPRESSION_RATIO_THRESHOLD) return false
@@ -219,8 +247,8 @@ export async function transcribeChunk(blob, { apiKey, signal, prompt, language =
     return { method: 'POST', body: form }
   }
 
-  const response = await groqFetch('/audio/transcriptions', buildInit, { apiKey, signal, timeoutMs: TIMEOUT_TRANSCRIPTION_MS })
-  const data = await response.json()
+  const response = await groqFetch('/audio/transcriptions', buildInit, { apiKey, signal, timeoutMs: transcriptionTimeoutMs(blob.size) })
+  const data = await readJsonWithTimeout(response, signal)
 
   const rawSegments = Array.isArray(data.segments) && data.segments.length > 0
     ? data.segments
@@ -257,7 +285,7 @@ export function toIsoLanguageCode(language) {
   if (!language) return null
   const value = String(language).trim().toLowerCase()
   if (/^[a-z]{2}$/.test(value)) return value
-  return WHISPER_LANGUAGE_CODES[value] || null
+  return Object.prototype.hasOwnProperty.call(WHISPER_LANGUAGE_CODES, value) ? WHISPER_LANGUAGE_CODES[value] : null
 }
 
 // 'french' / 'fr' -> 'fr' ; inconnu -> null.
@@ -310,7 +338,7 @@ export function createChatClient({ apiKey, signal }) {
     if (models) return models
     try {
       const response = await groqFetch('/models', () => ({ method: 'GET' }), { apiKey, signal })
-      const data = await response.json()
+      const data = await readJsonWithTimeout(response, signal)
       const available = new Set((data.data || []).map((m) => m.id))
       const preferred = TRANSLATION_MODEL_PREFERENCE.filter((m) => available.has(m.id))
       const known = new Set(TRANSLATION_MODEL_PREFERENCE.map((m) => m.id))
@@ -347,7 +375,7 @@ export function createChatClient({ apiKey, signal }) {
     })
 
     const response = await groqFetch('/chat/completions', buildInit, { apiKey, signal, modelErrors: true })
-    const data = await response.json()
+    const data = await readJsonWithTimeout(response, signal)
     const raw = String(data?.choices?.[0]?.message?.content || '')
     // Certains modèles de raisonnement laissent un bloc <think> ou des
     // balises de code autour du JSON.

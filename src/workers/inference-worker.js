@@ -191,6 +191,7 @@ async function transcribeSegment(audio, mode) {
 async function processOneSegment(segment, mode) {
   const { audio, startTime, endTime } = segment
   let failed = false
+  let stuck = false
 
   try {
     let transcription = null
@@ -201,7 +202,7 @@ async function processOneSegment(segment, mode) {
         transcription = await transcribeSegment(audio.slice(), mode)
       } catch (error) {
         lastError = error
-        if (error.timedOut) break
+        if (error.timedOut) { stuck = true; break }
       }
     }
     if (!transcription) throw lastError
@@ -230,7 +231,7 @@ async function processOneSegment(segment, mode) {
   // `failed` : le segment n'a rien produit à cause d'une erreur (et non
   // parce qu'il est silencieux). Le pool le signale, et il n'est pas
   // enregistré comme terminé : une reprise le retentera.
-  self.postMessage({ type: 'SEGMENT_DONE', failed })
+  self.postMessage({ type: 'SEGMENT_DONE', failed, stuck })
 }
 
 self.onmessage = (event) => {

@@ -3,7 +3,7 @@
 // hors-ligne. La mise en cache des poids du modèle IA (Whisper) est
 // gérée séparément par transformers.js, pas ici.
 
-const CACHE_NAME = 'app-shell-v10'
+const CACHE_NAME = 'app-shell-v10-1'
 const RUNTIME_CACHE_NAME = 'subline-runtime-v1'
 
 // Liste explicite plutôt que découverte dynamique : on sait exactement

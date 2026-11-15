@@ -29,6 +29,10 @@ const PROMPT_CONTEXT_CHARS = 300
 // comme sûre et l'imposer aux fenêtres suivantes (une fenêtre de musique
 // ou de bruit pourrait sinon la faire basculer).
 const LANGUAGE_LOCK_MIN_SEGMENTS = 3
+// La langue imposée est revérifiée régulièrement : tous les N morceaux, un
+// morceau est envoyé sans consigne de langue pour détecter un changement
+// (interview en anglais dans une vidéo française, par exemple).
+const LANGUAGE_PROBE_EVERY = 6
 
 /**
  * @param {File} file
@@ -57,6 +61,7 @@ export async function runOnlinePipeline(file, { apiKey, targetLanguage, duration
     let previousText = ''
     let producedAudio = false
     let lockedLanguage = null
+    let windowsSinceProbe = 0
 
     while (true) {
       if (signal?.aborted) return
@@ -79,7 +84,14 @@ export async function runOnlinePipeline(file, { apiKey, targetLanguage, duration
       const ownedLimit = cursor + STREAM_CHUNK_SECONDS
       const windowEnd = cursor + seconds
 
-      const { language, segments } = await transcribeChunk(blob, { apiKey, signal, prompt: previousText, language: lockedLanguage })
+      const probing = lockedLanguage !== null && windowsSinceProbe >= LANGUAGE_PROBE_EVERY
+      const { language, segments } = await transcribeChunk(blob, {
+        apiKey,
+        signal,
+        prompt: previousText,
+        language: probing ? null : lockedLanguage
+      })
+      windowsSinceProbe = probing ? 0 : windowsSinceProbe + 1
 
       recordAudioSeconds(seconds)
       const absolute = segments.map((s) => ({ ...s, start: cursor + s.start, end: cursor + s.end }))
@@ -91,14 +103,15 @@ export async function runOnlinePipeline(file, { apiKey, targetLanguage, duration
       // traduction : une fois traduites, leurs formules ne sont plus reconnaissables.
       const reliable = owned.filter((s) => s.reliable && !isLikelyHallucination(s.text))
 
-      if (!lockedLanguage && reliable.length >= LANGUAGE_LOCK_MIN_SEGMENTS) {
-        lockedLanguage = toIsoLanguageCode(language)
+      // Verrouillage (ou changement de langue constaté lors d'une vérification).
+      if ((!lockedLanguage || probing) && reliable.length >= LANGUAGE_LOCK_MIN_SEGMENTS) {
+        lockedLanguage = toIsoLanguageCode(language) || lockedLanguage
       }
       let texts = reliable.map((s) => s.text)
 
       if (texts.length > 0) {
         previousText = texts.join(' ').slice(-PROMPT_CONTEXT_CHARS)
-        if (needsTranslation(lockedLanguage || language, targetLanguage)) {
+        if (needsTranslation(probing ? language : (lockedLanguage || language), targetLanguage)) {
           texts = await translate(texts)
         }
       }

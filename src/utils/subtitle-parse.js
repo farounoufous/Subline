@@ -11,7 +11,10 @@ function toSeconds(h, m, s, ms) {
 export function cleanCueText(raw) {
   return raw
     // Dessins vectoriels ASS ({\p1}m 0 0 l ...{\p0}) : ce ne sont pas des répliques.
-    .replace(/\{\\p[1-9][^}]*\}[^{]*(?:\{\\p0[^}]*\})?/g, '')
+    // Seul un dessin refermé par {\p0} est supprimé ; sans fermeture, on
+    // retire la balise et le texte qui suit est conservé.
+    .replace(/\{\\p[1-9][^}]*\}[^{]*\{\\p0[^}]*\}/g, '')
+    .replace(/\{\\p[1-9][^}]*\}/g, '')
     .replace(/\{\\[^}]*\}/g, '')
     .replace(/\\N/g, ' ')
     .replace(/<[^>]+>/g, '')

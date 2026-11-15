@@ -487,6 +487,7 @@ export function useSubtitleGeneration() {
     resetRunState()
     subtitles.value = entry.subtitles
     outputLanguage.value = entry.language || 'en'
+    failedSegments.value = entry.failedSegments || 0
     totalDuration.value = entry.durationSeconds || 0
     readyUpToTime.value = totalDuration.value
     playbackUnlocked.value = true

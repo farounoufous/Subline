@@ -22,7 +22,12 @@ const MAX_WORKERS = 3
 // Whisper. Sans limite, tout l'audio d'un long film s'empilerait en
 // mémoire (64 Ko par seconde de parole). Le producteur attend donc que
 // la file repasse sous ce nombre de segments avant de décoder la suite.
+// La limite porte sur la file d'attente, et le décodage avance par lots :
+// la file peut donc dépasser brièvement ce nombre d'un lot (~5 min d'audio).
 const MAX_QUEUED_SEGMENTS = 8
+
+// Nombre maximal de remplacements de workers bloqués avant d'abandonner.
+const MAX_WORKER_REPLACEMENTS = 3
 
 function pickWorkerCount() {
   // Un seul worker sur un appareil limité : chaque worker charge sa propre
@@ -59,6 +64,7 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
   let finished = false
   let modelsReadyNotified = false
   let roomWaiters = []
+  let replacements = 0
   let resolvePromise
   let rejectPromise
 
@@ -107,59 +113,87 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
     maybeFinish()
   }
 
+  // Crée un worker. `leader` : le premier worker télécharge les modèles ;
+  // les autres (et les remplaçants) les lisent ensuite depuis le cache.
+  function spawnWorker(leader, loadAfter) {
+    const worker = new Worker(new URL('./inference-worker.js', import.meta.url), { type: 'module' })
+    const entry = { worker, assignedIndex: null, retired: false }
+    workers.push(entry)
+
+    worker.onmessage = (event) => {
+      if (entry.retired) return
+      const message = event.data
+
+      if (message.type === 'MODEL_PROGRESS') {
+        // Seul le premier worker télécharge réellement ; les autres
+        // lisent le cache instantanément, leur progression est ignorée.
+        if (leader) onModelProgress?.(message.percent)
+      } else if (message.type === 'MODELS_READY') {
+        if (leader) firstReadyResolve?.()
+        if (!modelsReadyNotified) {
+          modelsReadyNotified = true
+          onModelsReady?.()
+        }
+        idle.push(entry)
+        dispatch()
+      } else if (message.type === 'SUBTITLE') {
+        onSubtitle(entry.assignedIndex, {
+          startTime: message.startTime,
+          endTime: message.endTime,
+          text: message.text,
+          words: message.words
+        })
+      } else if (message.type === 'SEGMENT_DONE') {
+        busyCount--
+        onSegmentDone(entry.assignedIndex, { failed: Boolean(message.failed) })
+        entry.assignedIndex = null
+        if (message.stuck) {
+          replaceWorker(entry)
+        } else {
+          idle.push(entry)
+          dispatch()
+        }
+      } else if (message.type === 'ERROR') {
+        if (message.fatal) {
+          fail(message.message, message.code)
+        } else {
+          onError?.(message.message)
+        }
+      }
+    }
+
+    if (loadAfter) loadAfter.then(() => worker.postMessage({ type: 'START_LOADING' }))
+    else worker.postMessage({ type: 'START_LOADING' })
+    return entry
+  }
+
+  // Un délai d'inférence dépassé laisse le calcul d'origine tourner dans le
+  // worker, sur une session qui n'accepte pas deux exécutions simultanées :
+  // les segments suivants échoueraient en cascade. On le remplace par un
+  // worker neuf (modèles lus depuis le cache navigateur).
+  function replaceWorker(entry) {
+    entry.retired = true
+    entry.worker.terminate()
+    const position = workers.indexOf(entry)
+    if (position >= 0) workers.splice(position, 1)
+
+    if (finished) return
+    replacements++
+    if (replacements > MAX_WORKER_REPLACEMENTS) {
+      fail('Le moteur local ne répond plus. Relance la génération pour reprendre.', 'stuck')
+      return
+    }
+    spawnWorker(false, null)
+  }
+
+  let firstReadyResolve = null
+
   function start() {
     started = true
     const count = pickWorkerCount()
-    let firstReadyResolve
     const firstReady = new Promise((resolve) => { firstReadyResolve = resolve })
-
     for (let w = 0; w < count; w++) {
-      const worker = new Worker(new URL('./inference-worker.js', import.meta.url), { type: 'module' })
-      const entry = { worker, assignedIndex: null }
-      workers.push(entry)
-
-      worker.onmessage = (event) => {
-        const message = event.data
-
-        if (message.type === 'MODEL_PROGRESS') {
-          // Seul le premier worker télécharge réellement ; les autres
-          // lisent le cache instantanément, leur progression est ignorée.
-          if (w === 0) onModelProgress?.(message.percent)
-        } else if (message.type === 'MODELS_READY') {
-          if (w === 0) firstReadyResolve()
-          if (!modelsReadyNotified) {
-            modelsReadyNotified = true
-            onModelsReady?.()
-          }
-          idle.push(entry)
-          dispatch()
-        } else if (message.type === 'SUBTITLE') {
-          onSubtitle(entry.assignedIndex, {
-            startTime: message.startTime,
-            endTime: message.endTime,
-            text: message.text,
-            words: message.words
-          })
-        } else if (message.type === 'SEGMENT_DONE') {
-          busyCount--
-          onSegmentDone(entry.assignedIndex, { failed: Boolean(message.failed) })
-          entry.assignedIndex = null
-          idle.push(entry)
-          dispatch()
-        } else if (message.type === 'ERROR') {
-          if (message.fatal) {
-            fail(message.message, message.code)
-          } else {
-            onError?.(message.message)
-          }
-        }
-      }
-
-      if (w === 0) {
-        worker.postMessage({ type: 'START_LOADING' })
-      } else {
-        firstReady.then(() => worker.postMessage({ type: 'START_LOADING' }))
-      }
+      spawnWorker(w === 0, w === 0 ? null : firstReady)
     }
   }
 
