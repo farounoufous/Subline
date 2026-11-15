@@ -17,13 +17,18 @@ import {
   extractCompressedChunk
 } from '../audio/audio-stream.js'
 import { STREAM_CHUNK_SECONDS, STREAM_LOOKAHEAD_SECONDS } from '../audio/constants.js'
-import { transcribeChunk, createTranslator, needsTranslation, OnlineError } from './groq-client.js'
+import { transcribeChunk, createTranslator, needsTranslation, toIsoLanguageCode, OnlineError } from './groq-client.js'
+import { isLikelyHallucination } from '../utils/hallucination-filter.js'
 
 // Sous cette durée (secondes), le morceau est considéré comme vide.
 const MIN_CHUNK_SECONDS = 0.3
 // Nombre de caractères du texte précédent transmis à Whisper pour la
 // continuité (noms propres, vocabulaire).
 const PROMPT_CONTEXT_CHARS = 300
+// Nombre minimal de segments fiables pour considérer la langue détectée
+// comme sûre et l'imposer aux fenêtres suivantes (une fenêtre de musique
+// ou de bruit pourrait sinon la faire basculer).
+const LANGUAGE_LOCK_MIN_SEGMENTS = 3
 
 /**
  * @param {File} file
@@ -51,6 +56,7 @@ export async function runOnlinePipeline(file, { apiKey, targetLanguage, duration
     let cursor = startAt
     let previousText = ''
     let producedAudio = false
+    let lockedLanguage = null
 
     while (true) {
       if (signal?.aborted) return
@@ -73,7 +79,7 @@ export async function runOnlinePipeline(file, { apiKey, targetLanguage, duration
       const ownedLimit = cursor + STREAM_CHUNK_SECONDS
       const windowEnd = cursor + seconds
 
-      const { language, segments } = await transcribeChunk(blob, { apiKey, signal, prompt: previousText })
+      const { language, segments } = await transcribeChunk(blob, { apiKey, signal, prompt: previousText, language: lockedLanguage })
 
       recordAudioSeconds(seconds)
       const absolute = segments.map((s) => ({ ...s, start: cursor + s.start, end: cursor + s.end }))
@@ -81,12 +87,18 @@ export async function runOnlinePipeline(file, { apiKey, targetLanguage, duration
       const lastOwnedEnd = owned.length > 0 ? owned[owned.length - 1].end : 0
       const horizon = reachedEnd ? windowEnd : Math.min(Math.max(ownedLimit, lastOwnedEnd), windowEnd)
 
-      const reliable = owned.filter((s) => s.reliable)
+      // Les hallucinations sont écartées sur le texte d'origine, avant la
+      // traduction : une fois traduites, leurs formules ne sont plus reconnaissables.
+      const reliable = owned.filter((s) => s.reliable && !isLikelyHallucination(s.text))
+
+      if (!lockedLanguage && reliable.length >= LANGUAGE_LOCK_MIN_SEGMENTS) {
+        lockedLanguage = toIsoLanguageCode(language)
+      }
       let texts = reliable.map((s) => s.text)
 
       if (texts.length > 0) {
         previousText = texts.join(' ').slice(-PROMPT_CONTEXT_CHARS)
-        if (needsTranslation(language, targetLanguage)) {
+        if (needsTranslation(lockedLanguage || language, targetLanguage)) {
           texts = await translate(texts)
         }
       }

@@ -41,7 +41,11 @@ const MODEL_DTYPE = 'q8'
 
 function withTimeout(promise, ms) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Délai de ${ms}ms dépassé`)), ms)
+    const timer = setTimeout(() => {
+      const error = new Error(`Délai de ${ms}ms dépassé`)
+      error.timedOut = true
+      reject(error)
+    }, ms)
     promise.then(
       (value) => { clearTimeout(timer); resolve(value) },
       (error) => { clearTimeout(timer); reject(error) }
@@ -161,27 +165,47 @@ function groupWordsIntoClauses(chunks, segmentStartTime) {
 let previousEnglishText = ''
 let promptIdsSupported = true
 
+// Une inférence qui échoue pour une raison passagère est retentée une
+// fois. Après un délai dépassé on ne retente pas : l'inférence d'origine
+// peut encore tourner et le runtime ne supporte pas deux exécutions
+// simultanées sur la même session.
+const MAX_ATTEMPTS = 2
+
+async function transcribeSegment(audio, mode) {
+  const options = mode === 'translate'
+    ? { task: 'translate', return_timestamps: 'word' }
+    : { task: 'transcribe', language: 'english', return_timestamps: 'word' }
+
+  if (promptIdsSupported && previousEnglishText) {
+    try {
+      options.prompt_ids = transcriber.tokenizer.get_prompt_ids(previousEnglishText)
+    } catch (error) {
+      promptIdsSupported = false
+      console.warn('prompt_ids non supporté, contexte désactivé :', error.message)
+    }
+  }
+
+  return withTimeout(transcriber(audio, options), SEGMENT_INFERENCE_TIMEOUT_MS)
+}
+
 async function processOneSegment(segment, mode) {
   const { audio, startTime, endTime } = segment
+  let failed = false
 
   try {
-    const options = mode === 'translate'
-      ? { task: 'translate', return_timestamps: 'word' }
-      : { task: 'transcribe', language: 'english', return_timestamps: 'word' }
-
-    if (promptIdsSupported && previousEnglishText) {
+    let transcription = null
+    let lastError = null
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS && !transcription; attempt++) {
       try {
-        options.prompt_ids = transcriber.tokenizer.get_prompt_ids(previousEnglishText)
+        // Copie : le tampon d'origine reste intact pour une éventuelle nouvelle tentative.
+        transcription = await transcribeSegment(audio.slice(), mode)
       } catch (error) {
-        promptIdsSupported = false
-        console.warn('prompt_ids non supporté, contexte désactivé :', error.message)
+        lastError = error
+        if (error.timedOut) break
       }
     }
+    if (!transcription) throw lastError
 
-    const transcription = await withTimeout(
-      transcriber(audio, options),
-      SEGMENT_INFERENCE_TIMEOUT_MS
-    )
     const englishText = transcription.text.trim()
 
     if (englishText) {
@@ -199,10 +223,14 @@ async function processOneSegment(segment, mode) {
       }
     }
   } catch (error) {
+    failed = true
     self.postMessage({ type: 'ERROR', message: `Segment inference failed: ${error.message}` })
   }
 
-  self.postMessage({ type: 'SEGMENT_DONE' })
+  // `failed` : le segment n'a rien produit à cause d'une erreur (et non
+  // parce qu'il est silencieux). Le pool le signale, et il n'est pas
+  // enregistré comme terminé : une reprise le retentera.
+  self.postMessage({ type: 'SEGMENT_DONE', failed })
 }
 
 self.onmessage = (event) => {

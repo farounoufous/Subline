@@ -51,6 +51,8 @@ export function useSubtitleGeneration() {
   // Langue des sous-titres produits : 'en' | 'fr' | 'mixed' (reprise en local d'un travail en ligne)
   const outputLanguage = ref('en')
   const detectedLanguage = ref(null)
+  // Passages que Whisper n'a pas pu traiter (erreur d'inférence) : à retenter.
+  const failedSegments = ref(0)
   // Une génération en ligne interrompue peut être terminée en local.
   const canContinueLocally = computed(
     () => status.value === 'error' && engine.value === 'online' && errorKind.value !== 'auth' && subtitles.value.length > 0
@@ -100,6 +102,7 @@ export function useSubtitleGeneration() {
     errorMessage.value = ''
     errorKind.value = null
     detectedLanguage.value = null
+    failedSegments.value = 0
     outputLanguage.value = 'en'
   }
 
@@ -182,11 +185,17 @@ export function useSubtitleGeneration() {
         if (isStale()) return
         ensureEntry(index).blocks.push(...formatClause(clause))
       },
-      onSegmentDone: (index) => {
+      onSegmentDone: (index, { failed = false } = {}) => {
         if (isStale()) return
         registry[index].done = true
-        const entry = ensureEntry(index)
-        doneSegments.set(index, { ...entry })
+        if (failed) {
+          // Un passage en échec n'est pas enregistré comme terminé : une
+          // reprise le retentera au lieu de garder un trou définitif.
+          failedSegments.value++
+        } else {
+          const entry = ensureEntry(index)
+          doneSegments.set(index, { ...entry })
+        }
         rebuildSubtitles()
         recomputeReady()
         maybeSavePartial()
@@ -290,6 +299,10 @@ export function useSubtitleGeneration() {
 
         rebuildSubtitles()
         recomputeReady()
+
+        // Contre-pression : on ne décode la suite que lorsque Whisper a
+        // écoulé l'essentiel de la file (voir worker-pool.js).
+        if (pool) await pool.waitForRoom()
       }
 
       if (fatalError) throw fatalError
@@ -307,7 +320,10 @@ export function useSubtitleGeneration() {
       etaSeconds.value = null
       status.value = 'ready'
 
-      deletePartialProgress(storageKey).catch(() => {})
+      // S'il reste des passages en échec, la progression est conservée :
+      // relancer la génération ne retraite que ces passages.
+      if (failedSegments.value === 0) deletePartialProgress(storageKey).catch(() => {})
+      else maybeSavePartial(true)
       if (seedPartialKey) deletePartialProgress(seedPartialKey).catch(() => {})
       return subtitles.value
     } catch (error) {
@@ -501,6 +517,7 @@ export function useSubtitleGeneration() {
     errorKind,
     outputLanguage,
     detectedLanguage,
+    failedSegments,
     canContinueLocally,
     start,
     startOnline,

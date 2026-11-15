@@ -1,6 +1,6 @@
 # Subline
 
-Sous-titres anglais générés 100% en local dans le navigateur (Whisper), utilisables hors ligne.
+Sous-titres générés dans le navigateur avec Whisper : en local et hors ligne par défaut (sortie anglaise), ou en ligne sur choix explicite (français ou anglais).
 
 ## Développement
 
@@ -35,6 +35,15 @@ Utiliser `build` + `preview` (pas `npm run dev`) pour tester le chargement des m
 - **Résumé et chapitres** : `src/online/summary.js`. La transcription est découpée en parties d'environ 9 000 caractères (limite par minute du palier gratuit), chaque partie donne résumé + chapitres, puis un appel fusionne les résumés. Les chapitres hors de l'extrait sont écartés, ceux à moins de 45 s sont fusionnés. Le résultat est stocké avec les sous-titres (champ `outline`). Seul le texte est envoyé.
 - **Client de chat partagé** : `createChatClient` (groq-client.js) porte la résolution des modèles et le repli ; le traducteur et le résumé l'utilisent.
 - **Téléphone** : `src/utils/device.js` repère les appareils limités (mobile, 4 Go ou moins, 2 cœurs ou moins) : avertissement dans le mode Local avec bouton vers le mode En ligne, un seul worker Whisper. Local reste le mode par défaut. Mise en page adaptée, cibles tactiles agrandies, plein écran natif quand l'élément ne peut pas l'être (iOS).
+
+## Fiabilité (v10)
+
+- **Passages en échec** : si Whisper échoue sur un segment (une nouvelle tentative est faite, sauf après un délai dépassé), il n'est plus enregistré comme terminé. Un avertissement indique le nombre de passages manquants, et relancer la génération ne retraite que ceux-là (la progression est conservée tant qu'il en reste).
+- **Contre-pression** (`worker-pool.js`, `waitForRoom`) : le décodage audio attend que la file de segments repasse sous 8 avant de décoder la suite, pour ne pas empiler tout l'audio d'un long film en mémoire.
+- **Filtre d'hallucinations** : formules françaises ajoutées, frontières de mots Unicode (les mots finissant par une lettre accentuée étaient ignorés), et filtrage du texte d'origine avant la traduction. Une formule n'est écartée que si elle occupe l'essentiel de la ligne.
+- **Mode En ligne** : délai maximal par requête (180 s pour la transcription, 90 s sinon), traité comme une coupure réseau ; langue détectée imposée aux fenêtres suivantes une fois 3 segments fiables obtenus.
+- **Sous-titres intégrés** : les dessins vectoriels ASS ne sont plus lus comme des répliques.
+- **Quota** : seule la limite quotidienne est affichée ; la limite horaire n'apparaît que si elle est presque atteinte.
 
 ## Architecture
 

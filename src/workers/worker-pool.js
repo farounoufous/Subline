@@ -18,6 +18,12 @@
 import { detectDevice } from '../utils/device.js'
 const MAX_WORKERS = 3
 
+// Contre-pression : le décodage audio et le VAD vont bien plus vite que
+// Whisper. Sans limite, tout l'audio d'un long film s'empilerait en
+// mémoire (64 Ko par seconde de parole). Le producteur attend donc que
+// la file repasse sous ce nombre de segments avant de décoder la suite.
+const MAX_QUEUED_SEGMENTS = 8
+
 function pickWorkerCount() {
   // Un seul worker sur un appareil limité : chaque worker charge sa propre
   // copie du modèle, ce qui épuise vite la mémoire d'un téléphone.
@@ -30,13 +36,14 @@ function pickWorkerCount() {
  * @param {'english' | 'translate'} mode
  * @param {{
  *   onSubtitle: (segmentIndex: number, clause: object) => void,
- *   onSegmentDone: (segmentIndex: number) => void,
+ *   onSegmentDone: (segmentIndex: number, result: { failed: boolean }) => void,
  *   onModelProgress: (percent: number) => void,
  *   onModelsReady: () => void,
  *   onError: (message: string) => void
  * }} callbacks
  * @returns {{
  *   enqueue: (segments: { index: number, audio: Float32Array, startTime: number, endTime: number }[]) => void,
+ *   waitForRoom: () => Promise<void>,
  *   close: () => void,
  *   cancel: () => void,
  *   promise: Promise<void>
@@ -51,6 +58,7 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
   let closed = false
   let finished = false
   let modelsReadyNotified = false
+  let roomWaiters = []
   let resolvePromise
   let rejectPromise
 
@@ -59,7 +67,15 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
     rejectPromise = reject
   })
 
+  function releaseWaiters(force = false) {
+    if (!force && queue.length > MAX_QUEUED_SEGMENTS) return
+    const waiters = roomWaiters
+    roomWaiters = []
+    waiters.forEach((resolve) => resolve())
+  }
+
   function terminateAll() {
+    releaseWaiters(true)
     workers.forEach((entry) => entry.worker.terminate())
   }
 
@@ -87,6 +103,7 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
       busyCount++
       entry.worker.postMessage({ type: 'PROCESS_SEGMENT', segment, mode }, [segment.audio.buffer])
     }
+    releaseWaiters()
     maybeFinish()
   }
 
@@ -125,7 +142,7 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
           })
         } else if (message.type === 'SEGMENT_DONE') {
           busyCount--
-          onSegmentDone(entry.assignedIndex)
+          onSegmentDone(entry.assignedIndex, { failed: Boolean(message.failed) })
           entry.assignedIndex = null
           idle.push(entry)
           dispatch()
@@ -153,6 +170,11 @@ export function createInferencePool(mode, { onSubtitle, onSegmentDone, onModelPr
       queue.push(...segments)
       if (!started) start()
       dispatch()
+    },
+    // Résout quand la file est assez courte pour décoder la suite.
+    waitForRoom() {
+      if (finished || queue.length <= MAX_QUEUED_SEGMENTS) return Promise.resolve()
+      return new Promise((resolve) => roomWaiters.push(resolve))
     },
     close() {
       closed = true

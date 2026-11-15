@@ -94,6 +94,8 @@ export const en = {
   'phase.etaLess': 'less than a minute',
   'phase.etaMinutes': 'about {minutes} min',
 
+  'ready.failedSegments': "{count} passage(s) could not be transcribed and are missing from the subtitles.",
+  'ready.retryFailed': 'Retry these passages',
   'ready.none': 'No speech detected in this file.',
   'ready.restored': 'Subtitles restored from the local cache.',
   'ready.done': 'Subtitles ready.',
@@ -172,9 +174,6 @@ export const en = {
   'net.retrying': "Unstable connection: retrying in {seconds} s (attempt {attempt}/{max}). Progress is kept.",
   'net.offline': "Offline: generation will resume by itself when the network is back. Progress is kept.",
   'data.sentRun': "Sent for this file: {size}",
-  'quota.data': "Data sent",
-  'quota.dataToday': "Today",
-  'quota.dataMonth': "This month",
   'err.unexpectedSummary': "Unexpected summary response.",
   'outline.tooShort': "The text is too short to produce a summary.",
   'tab.transcript': "Transcript",
@@ -195,12 +194,6 @@ export const en = {
   'drop.titleTouch': "Choose your videos or audio files",
   'local.limitedWarning': "This device looks limited (phone, low memory or few cores): Local mode may be very slow or fail for lack of memory. Online mode is recommended.",
   'local.switchToOnline': "Switch to Online mode",
-  'quota.title': 'Groq free quota',
-  'quota.hour': 'Last hour',
-  'quota.day': 'Last 24 h',
-  'quota.minutes': '{used} / {limit} min',
-  'quota.requestsLeft': 'Requests left (per Groq): {count}',
-  'quota.note': 'Estimate based on what this device has sent; exact limits are in your Groq console.',
 
   'queue.title': 'Queue',
   'queue.empty': 'No files waiting.',
@@ -231,5 +224,13 @@ export const en = {
   'history.title': 'Already subtitled files',
   'history.hint': 'Drop one of these files again: its subtitles are restored instantly.',
   'history.empty': 'None yet.',
-  'history.delete': 'Delete'
+  'history.delete': 'Delete',
+  'quota.title': 'Daily limit',
+  'quota.left': '{time} left',
+  'quota.used': '{used} used of {limit}',
+  'quota.durationM': '{m} min',
+  'quota.durationH': '{h} h',
+  'quota.durationHM': '{h} h {m}',
+  'quota.hourNear': 'The hourly limit is almost reached: a short pause may be needed.',
+  'quota.note': 'Estimate based on what this device has sent; exact limits are shown in your Groq console.'
 }

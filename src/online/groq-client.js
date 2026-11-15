@@ -37,6 +37,13 @@ const MAX_RETRY_WAIT_SECONDS = 60
 const MAX_RATE_LIMIT_RETRIES = 3
 const MAX_SERVER_ERROR_RETRIES = 2
 
+// Délai maximal avant l'arrivée de la réponse. Sans lui, une connexion qui
+// se fige sans erreur bloquerait la file indéfiniment. Un dépassement est
+// traité comme une coupure réseau (nouvelle tentative avec compte à rebours).
+// La transcription est large : elle envoie ~1,3 Mo sur une liaison lente.
+const TIMEOUT_TRANSCRIPTION_MS = 180_000
+const TIMEOUT_DEFAULT_MS = 90_000
+
 // Seuils habituels de Whisper pour écarter les segments non fiables.
 const NO_SPEECH_PROB_THRESHOLD = 0.6
 const LOW_LOGPROB_THRESHOLD = -1
@@ -102,12 +109,21 @@ async function groqFetch(path, buildInit, options) {
   }
 }
 
-async function groqFetchOnce(path, buildInit, { apiKey, signal, modelErrors = false }) {
+async function groqFetchOnce(path, buildInit, { apiKey, signal, modelErrors = false, timeoutMs = TIMEOUT_DEFAULT_MS }) {
   let rateLimitRetries = 0
   let serverErrorRetries = 0
   let networkRetries = 0
 
   while (true) {
+    if (signal?.aborted) throw new DOMException('Annulé', 'AbortError')
+
+    // Un contrôleur par tentative : il relaie l'annulation de l'utilisateur
+    // et ajoute le délai maximal.
+    const attempt = new AbortController()
+    const relayAbort = () => attempt.abort()
+    signal?.addEventListener('abort', relayAbort, { once: true })
+    const timer = setTimeout(relayAbort, timeoutMs)
+
     let response
     try {
       const init = buildInit()
@@ -115,10 +131,12 @@ async function groqFetchOnce(path, buildInit, { apiKey, signal, modelErrors = fa
       response = await fetch(`${API_BASE}${path}`, {
         ...init,
         headers: { Authorization: `Bearer ${apiKey}`, ...(init.headers || {}) },
-        signal
+        signal: attempt.signal
       })
     } catch (error) {
-      if (error.name === 'AbortError') throw error
+      // Annulation voulue par l'utilisateur ; un simple délai dépassé,
+      // lui, retombe dans le traitement des coupures ci-dessous.
+      if (signal?.aborted) throw new DOMException('Annulé', 'AbortError')
 
       // Hors ligne : on attend le retour du réseau (sans compter d'essai).
       if (navigator.onLine === false) {
@@ -133,6 +151,9 @@ async function groqFetchOnce(path, buildInit, { apiKey, signal, modelErrors = fa
       await waitWithCountdown(NETWORK_RETRY_DELAYS[networkRetries], signal)
       networkRetries++
       continue
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', relayAbort)
     }
     clearNetworkNotice()
 
@@ -183,7 +204,7 @@ function isReliableSegment(segment) {
  *
  * @returns {{ language: string | undefined, segments: { start: number, end: number, text: string, reliable: boolean }[] }}
  */
-export async function transcribeChunk(blob, { apiKey, signal, prompt }) {
+export async function transcribeChunk(blob, { apiKey, signal, prompt, language = null }) {
   const buildInit = () => {
     const form = new FormData()
     form.append('file', blob, 'audio.mp3')
@@ -192,10 +213,13 @@ export async function transcribeChunk(blob, { apiKey, signal, prompt }) {
     form.append('timestamp_granularities[]', 'segment')
     form.append('temperature', '0')
     if (prompt) form.append('prompt', prompt.slice(-500))
+    // Langue imposée une fois détectée de façon fiable : évite qu'une
+    // fenêtre de musique ou de bruit la fasse basculer.
+    if (language) form.append('language', language)
     return { method: 'POST', body: form }
   }
 
-  const response = await groqFetch('/audio/transcriptions', buildInit, { apiKey, signal })
+  const response = await groqFetch('/audio/transcriptions', buildInit, { apiKey, signal, timeoutMs: TIMEOUT_TRANSCRIPTION_MS })
   const data = await response.json()
 
   const rawSegments = Array.isArray(data.segments) && data.segments.length > 0
@@ -216,6 +240,24 @@ export async function transcribeChunk(blob, { apiKey, signal, prompt }) {
     .filter((s) => s.text)
 
   return { language: data.language, segments }
+}
+
+// Noms de langue renvoyés par Whisper -> code ISO 639-1 attendu par le
+// paramètre `language`. Une langue absente de cette table n'est pas imposée.
+const WHISPER_LANGUAGE_CODES = {
+  english: 'en', french: 'fr', spanish: 'es', german: 'de', italian: 'it', portuguese: 'pt',
+  dutch: 'nl', arabic: 'ar', chinese: 'zh', japanese: 'ja', korean: 'ko', russian: 'ru',
+  turkish: 'tr', polish: 'pl', ukrainian: 'uk', hindi: 'hi', swedish: 'sv', norwegian: 'no',
+  danish: 'da', finnish: 'fi', greek: 'el', czech: 'cs', romanian: 'ro', hungarian: 'hu',
+  hebrew: 'he', indonesian: 'id', vietnamese: 'vi', thai: 'th', urdu: 'ur', catalan: 'ca'
+}
+
+/** 'French' / 'fr' -> 'fr' ; langue inconnue -> null. */
+export function toIsoLanguageCode(language) {
+  if (!language) return null
+  const value = String(language).trim().toLowerCase()
+  if (/^[a-z]{2}$/.test(value)) return value
+  return WHISPER_LANGUAGE_CODES[value] || null
 }
 
 // 'french' / 'fr' -> 'fr' ; inconnu -> null.

@@ -2,6 +2,12 @@
 
 export const TARGET_SAMPLE_RATE = 16000
 
+// Durée maximale d'un segment envoyé à Whisper. Les segments viennent
+// maintenant du VAD (découpage aux frontières réelles de la parole),
+// pas d'un découpage fixe : cette constante ne sert plus qu'à re-découper
+// les rares passages de parole continue plus longs que ça (un long
+// monologue sans pause détectée), Whisper étant conçu pour des fenêtres
+// de 30 secondes maximum.
 export const MAX_SEGMENT_DURATION_SECONDS = 28
 
 // Durée de contenu (chronologiquement continue depuis le début) qui

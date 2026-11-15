@@ -45,6 +45,7 @@ const {
   engine,
   errorKind,
   outputLanguage,
+  failedSegments,
   canContinueLocally
 } = generation
 
@@ -848,6 +849,15 @@ onBeforeUnmount(() => {
                   <AppIcon name="download" class="h-4 w-4" /> {{ t('export.vtt') }}
                 </button>
               </div>
+            </div>
+
+            <div
+              v-if="status === 'ready' && failedSegments > 0"
+              class="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-amber-50 px-4 py-3"
+              role="status"
+            >
+              <p class="text-sm text-amber-900">{{ t('ready.failedSegments', { count: failedSegments }) }}</p>
+              <button class="btn-secondary !px-3 !py-1.5" @click="backToSettings">{{ t('ready.retryFailed') }}</button>
             </div>
 
             <div v-if="status === 'error'" class="flex flex-col gap-3 rounded-xl bg-red-50 px-4 py-3">

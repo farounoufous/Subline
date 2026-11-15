@@ -10,7 +10,10 @@
 // pour ne jamais effacer une vraie réplique ("Thank you." seul est
 // conservé, par exemple).
 
+// Formules typiques de Whisper (anglais et français), écrites sous la forme
+// normalisée par normalizeText : minuscules, sans accents ni ponctuation.
 const KNOWN_HALLUCINATIONS = [
+  // Anglais
   'thanks for watching',
   'thank you for watching',
   'please subscribe',
@@ -20,8 +23,25 @@ const KNOWN_HALLUCINATIONS = [
   'subtitles by',
   'amara org',
   'transcribed by',
-  'translated by'
+  'translated by',
+  // Français
+  'sous titrage st',
+  'sous titrage societe radio canada',
+  'sous titres realises par',
+  'sous titres par',
+  'merci d avoir regarde',
+  'n oubliez pas de vous abonner',
+  'abonnez vous a la chaine',
+  'a bientot pour une nouvelle video',
+  'a la prochaine pour une nouvelle video'
 ]
+
+// Une formule n'est écartée que si elle occupe l'essentiel de la ligne :
+// un vrai « merci d'avoir regardé » au milieu d'une longue phrase reste.
+const PHRASE_EXTRA_WORDS_ALLOWED = 6
+
+// Mentions qui ne sont jamais de la parole réelle : écartées où qu'elles soient.
+const ALWAYS_HALLUCINATION = ['amara org']
 
 // Étiquettes descriptives ajoutées par Whisper : [Music], (silence)...
 const DESCRIPTIVE_TAG = /^[\[(*♪\s]*(music|musique|silence|blank_audio|applause|laughter|noise)[\])*♪\s.]*$/i
@@ -30,6 +50,8 @@ const NO_LETTERS = /^[^\p{L}\p{N}]*$/u
 export function normalizeText(text) {
   return text
     .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim()
@@ -44,7 +66,9 @@ function hasRunawayRepetition(normalized) {
     run = words[i] === words[i - 1] ? run + 1 : 1
     if (run >= 5) return true
   }
-  return /(\b[\p{L}\p{N}']+(?: [\p{L}\p{N}']+){1,5}\b)(?: \1){3,}/u.test(normalized)
+  // \b est limité à l'ASCII en JavaScript : « là » ou « été » en fin de
+  // groupe échapperaient à la détection. On borne avec des classes Unicode.
+  return /((?<![\p{L}\p{N}'])[\p{L}\p{N}']+(?: [\p{L}\p{N}']+){1,5}(?![\p{L}\p{N}']))(?: \1){3,}/u.test(normalized)
 }
 
 export function isLikelyHallucination(text) {
@@ -52,7 +76,11 @@ export function isLikelyHallucination(text) {
   if (NO_LETTERS.test(trimmed) || DESCRIPTIVE_TAG.test(trimmed)) return true
 
   const normalized = normalizeText(trimmed)
-  if (KNOWN_HALLUCINATIONS.some((phrase) => normalized.includes(phrase))) return true
+  const wordCount = normalized.split(' ').length
+  const isKnownPhrase = KNOWN_HALLUCINATIONS.some(
+    (phrase) => normalized.includes(phrase) && wordCount <= phrase.split(' ').length + PHRASE_EXTRA_WORDS_ALLOWED
+  )
+  if (isKnownPhrase || ALWAYS_HALLUCINATION.some((phrase) => normalized.includes(phrase))) return true
   return hasRunawayRepetition(normalized)
 }
 
