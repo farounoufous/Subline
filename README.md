@@ -36,7 +36,7 @@ Utiliser `build` + `preview` (pas `npm run dev`) pour tester le chargement des m
 - **Client de chat partagé** : `createChatClient` (groq-client.js) porte la résolution des modèles et le repli ; le traducteur et le résumé l'utilisent.
 - **Téléphone** : `src/utils/device.js` repère les appareils limités (mobile, 4 Go ou moins, 2 cœurs ou moins) : avertissement dans le mode Local avec bouton vers le mode En ligne, un seul worker Whisper. Local reste le mode par défaut. Mise en page adaptée, cibles tactiles agrandies, plein écran natif quand l'élément ne peut pas l'être (iOS).
 
-## Fiabilité (v10.1)
+## Fiabilité (v10.2)
 
 - **Passages en échec** : si Whisper échoue sur un segment (nouvelle tentative, sauf après un délai dépassé), il n'est pas enregistré comme terminé. Un bandeau indique le nombre de passages manquants et propose de les retraiter ; le compte est conservé avec le résultat, donc le bandeau réapparaît après un rechargement. Relancer la génération ne retraite que ces passages.
 - **Moteur local bloqué** : après un délai d'inférence dépassé, le worker concerné est arrêté et remplacé (3 remplacements au maximum), au lieu de laisser les segments suivants échouer en cascade.
@@ -44,6 +44,7 @@ Utiliser `build` + `preview` (pas `npm run dev`) pour tester le chargement des m
 - **Filtre d'hallucinations** : formules françaises, frontières Unicode, filtrage avant traduction. Une formule n'est écartée que si elle ouvre ou clôt la ligne ; les boucles ne sont détectées qu'à partir de 8 mots identiques ou 5 répétitions d'un groupe. Détection sans lookbehind (compatible Safari ancien).
 - **Mode En ligne** : le délai de la transcription s'adapte à la taille du fichier envoyé (90 s à 10 min, débit minimal de 4 Ko/s), la lecture de la réponse a son propre délai, et un dépassement est traité comme une coupure réseau. La langue détectée est imposée après 3 segments fiables, puis revérifiée tous les 6 morceaux pour détecter un changement de langue.
 - **Sous-titres intégrés** : les dessins vectoriels ASS ne sont plus lus comme des répliques (seuls les dessins refermés sont retirés).
+- **Hors ligne après une mise à jour** : les scripts et styles versionnés vivent dans un cache séparé (`subline-assets-v1`) qui survit aux mises à jour, sont préchargés dès l'installation du service worker, et retrouvés malgré l'en-tête `Vary: Origin`. Avant, une nouvelle version supprimait les fichiers qu'elle venait de charger ou ne les retrouvait pas : l'app restait blanche hors ligne.
 - **Quota** : seule la limite quotidienne est affichée ; la limite horaire n'apparaît que si elle est presque atteinte.
 
 ## Architecture

@@ -3,7 +3,20 @@
 // hors-ligne. La mise en cache des poids du modèle IA (Whisper) est
 // gérée séparément par transformers.js, pas ici.
 
-const CACHE_NAME = 'app-shell-v10-1'
+const CACHE_NAME = 'app-shell-v10-3'
+// Fichiers versionnés par leur nom (assets/xxx-HASH.js) : cache séparé, qui
+// survit aux mises à jour. Sinon l'activation d'une nouvelle version
+// supprimerait les fichiers que la page venait de charger, et l'app ne
+// s'ouvrirait plus hors ligne tant qu'une seconde visite en ligne n'avait pas
+// eu lieu.
+const ASSET_CACHE_NAME = 'subline-assets-v1'
+const ASSET_CACHE_MAX_ENTRIES = 60
+
+// Les fichiers sont servis avec « Vary: Origin » : une réponse mise en cache
+// par une requête sans en-tête Origin (préchargement) ne correspondrait pas à
+// la requête d'un script de module (qui en envoie un), et le fichier serait
+// introuvable hors ligne. Ces fichiers ne varient pas selon l'origine.
+const MATCH_OPTIONS = { ignoreVary: true }
 const RUNTIME_CACHE_NAME = 'subline-runtime-v1'
 
 // Liste explicite plutôt que découverte dynamique : on sait exactement
@@ -23,11 +36,40 @@ const APP_SHELL_FILES = [
 // en cache à la demande, lors de la première génération de
 // sous-titres, par le gestionnaire fetch ci-dessous.
 
+// Met en cache les scripts et styles référencés par les pages de l'app :
+// la nouvelle version est utilisable hors ligne dès son installation.
+async function precacheReferencedAssets() {
+  try {
+    const cache = await caches.open(ASSET_CACHE_NAME)
+    const urls = new Set()
+    for (const page of ['/index.html', '/app.html']) {
+      const html = await (await fetch(page, { cache: 'no-cache' })).text()
+      for (const match of html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)) urls.add(match[1])
+    }
+    await Promise.all([...urls].map(async (url) => {
+      if (await cache.match(url, MATCH_OPTIONS)) return
+      const response = await fetch(url)
+      if (response.ok) await cache.put(url, response)
+    }))
+  } catch {
+    // Non bloquant : le cache à la demande prend le relais.
+  }
+}
+
+// Les noms changent à chaque version : on borne la taille du cache en
+// retirant les plus anciens fichiers.
+async function pruneAssetCache() {
+  const cache = await caches.open(ASSET_CACHE_NAME)
+  const keys = await cache.keys()
+  await Promise.all(keys.slice(0, Math.max(0, keys.length - ASSET_CACHE_MAX_ENTRIES)).map((key) => cache.delete(key)))
+}
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches
       .open(CACHE_NAME)
       .then((cache) => cache.addAll(APP_SHELL_FILES))
+      .then(precacheReferencedAssets)
       .then(() => self.skipWaiting())
   )
 })
@@ -46,6 +88,7 @@ self.addEventListener('activate', (event) => {
             .map((name) => caches.delete(name))
         )
       )
+      .then(pruneAssetCache)
       .then(() => self.clients.claim())
   )
 })
@@ -62,7 +105,7 @@ function isHeavyRuntimeRequest(url) {
 }
 
 async function cacheFirst(request, cacheName) {
-  const cached = await caches.match(request)
+  const cached = await caches.match(request, MATCH_OPTIONS)
   if (cached) return cached
 
   const response = await fetch(request)
@@ -85,7 +128,7 @@ async function networkFirst(request) {
     }
     return response
   } catch {
-    const cached = await caches.match(request)
+    const cached = await caches.match(request, MATCH_OPTIONS)
     if (cached) return cached
     return new Response('Contenu indisponible hors-ligne.', { status: 503, statusText: 'Service indisponible hors-ligne' })
   }
@@ -114,6 +157,6 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(cacheFirst(event.request, RUNTIME_CACHE_NAME).catch(() => new Response('', { status: 503 })))
   } else {
     // Fichiers versionnés par leur nom (assets/xxx-HASH.js) : cache-first.
-    event.respondWith(cacheFirst(event.request, CACHE_NAME).catch(() => new Response('', { status: 503 })))
+    event.respondWith(cacheFirst(event.request, ASSET_CACHE_NAME).catch(() => new Response('', { status: 503 })))
   }
 })
